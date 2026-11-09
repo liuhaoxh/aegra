@@ -22,6 +22,7 @@ pretending to have verified anything.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import AsyncIterator
 from urllib.parse import urlsplit
 
@@ -32,6 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from aegra_api.core.orm import Assistant as AssistantORM
 from aegra_api.core.orm import Run as RunORM
 from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models.auth import User
@@ -39,11 +41,16 @@ from aegra_api.services.run_preparation import (
     ADMISSION_UNIQUE_INDEX,
     _is_admission_conflict,
     authorize_thread_scope,
+    bind_thread_scope,
 )
 
 pytestmark = pytest.mark.asyncio
 
 DEFAULT_TENANT = "default"
+
+# Payload principal tenant: "use the row's own tenant", i.e. what production
+# projects into the stored principal. ``None`` is the explicit "no claim".
+_ROW_TENANT = object()
 
 
 def _database_url() -> str:
@@ -90,7 +97,13 @@ async def maker(engine: AsyncEngine) -> async_sessionmaker:
 
 
 async def _seed_thread(maker: async_sessionmaker, *, thread_id: str, owner: str, tenant: str) -> None:
+    """Create one thread under an explicit scope, replacing any stale row.
+
+    The suite runs against a persistent database: a row left behind by an
+    aborted run must not turn the next run into a ``thread_pkey`` duplicate.
+    """
     async with maker() as session:
+        await session.execute(text("delete from thread where thread_id = :t"), {"t": thread_id})
         session.add(ThreadORM(thread_id=thread_id, user_id=owner, tenant_id=tenant, status="idle"))
         await session.commit()
 
@@ -102,20 +115,70 @@ async def _drop_thread(maker: async_sessionmaker, thread_id: str) -> None:
         await session.commit()
 
 
+async def _seed_assistant(maker: async_sessionmaker, *, assistant_id: str, owner: str, tenant: str) -> None:
+    """Create one real assistant row, replacing any stale one.
+
+    ``crons.assistant_id`` (and ``runs.assistant_id``) is a real foreign key, so
+    the referenced row has to exist in this database before the child insert can
+    be exercised at all — the FK is the point of the test, not a reason to skip.
+    """
+    async with maker() as session:
+        await session.execute(text("delete from assistant where assistant_id = :a"), {"a": assistant_id})
+        session.add(
+            AssistantORM(
+                assistant_id=assistant_id,
+                name=assistant_id,
+                graph_id="adm-seed-graph",
+                config={"adm_seed": assistant_id},
+                user_id=owner,
+                tenant_id=tenant,
+            )
+        )
+        await session.commit()
+
+
+async def _drop_assistant(maker: async_sessionmaker, assistant_id: str) -> None:
+    async with maker() as session:
+        await session.execute(text("delete from assistant where assistant_id = :a"), {"a": assistant_id})
+        await session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Scope authorization against real rows
 # ---------------------------------------------------------------------------
-
-
 async def test_same_tenant_and_owner_is_allowed(maker: async_sessionmaker) -> None:
     thread_id, owner = "adm-ok-1", "adm-user-1"
     await _seed_thread(maker, thread_id=thread_id, owner=owner, tenant=DEFAULT_TENANT)
+    principal = User(identity=owner, tenant_id=DEFAULT_TENANT)
     try:
         async with maker() as session:
             # The protected thread must NOT be rejected: this is the exact
             # regression a scalar() implementation caused.
-            await authorize_thread_scope(session, thread_id, User(identity=owner))
-            await authorize_thread_scope(session, thread_id, User(identity=owner, tenant_id=DEFAULT_TENANT))
+            await authorize_thread_scope(session, thread_id, principal)
+            await bind_thread_scope(session, thread_id, principal)
+            await session.commit()
+    finally:
+        await _drop_thread(maker, thread_id)
+
+
+async def test_missing_tenant_claim_is_refused(maker: async_sessionmaker) -> None:
+    """A principal with no tenant claim is refused, never scoped to a default.
+
+    The strict gate is the point of the feature: ``identity`` alone must not
+    authorize a row, not even the principal's own thread.
+    """
+    thread_id, owner = "adm-notenant-1", "adm-user-1"
+    await _seed_thread(maker, thread_id=thread_id, owner=owner, tenant=DEFAULT_TENANT)
+    unscoped = User(identity=owner)
+    try:
+        async with maker() as session:
+            with pytest.raises(HTTPException) as preflight:
+                await authorize_thread_scope(session, thread_id, unscoped)
+            assert preflight.value.status_code == 403
+            with pytest.raises(HTTPException) as bind:
+                await bind_thread_scope(session, thread_id, unscoped)
+            assert bind.value.status_code == 403
+            await session.rollback()
     finally:
         await _drop_thread(maker, thread_id)
 
@@ -123,13 +186,16 @@ async def test_same_tenant_and_owner_is_allowed(maker: async_sessionmaker) -> No
 async def test_cross_tenant_is_not_found(maker: async_sessionmaker) -> None:
     thread_id, owner = "adm-xtenant-1", "adm-user-1"
     await _seed_thread(maker, thread_id=thread_id, owner=owner, tenant="acme")
+    foreign = User(identity=owner, tenant_id="other")
     try:
         async with maker() as session:
-            with pytest.raises(HTTPException) as exc:
-                await authorize_thread_scope(session, thread_id, User(identity=owner))
-            assert exc.value.status_code == 404
-            with pytest.raises(HTTPException):
-                await authorize_thread_scope(session, thread_id, User(identity=owner, tenant_id="other"))
+            with pytest.raises(HTTPException) as preflight:
+                await authorize_thread_scope(session, thread_id, foreign)
+            assert preflight.value.status_code == 404
+            with pytest.raises(HTTPException) as bind:
+                await bind_thread_scope(session, thread_id, foreign)
+            assert bind.value.status_code == 404
+            await session.rollback()
     finally:
         await _drop_thread(maker, thread_id)
 
@@ -137,11 +203,16 @@ async def test_cross_tenant_is_not_found(maker: async_sessionmaker) -> None:
 async def test_cross_owner_is_not_found(maker: async_sessionmaker) -> None:
     thread_id = "adm-xowner-1"
     await _seed_thread(maker, thread_id=thread_id, owner="adm-user-other", tenant=DEFAULT_TENANT)
+    caller = User(identity="adm-user-1", tenant_id=DEFAULT_TENANT)
     try:
         async with maker() as session:
-            with pytest.raises(HTTPException) as exc:
-                await authorize_thread_scope(session, thread_id, User(identity="adm-user-1"))
-            assert exc.value.status_code == 404
+            with pytest.raises(HTTPException) as preflight:
+                await authorize_thread_scope(session, thread_id, caller)
+            assert preflight.value.status_code == 404
+            with pytest.raises(HTTPException) as bind:
+                await bind_thread_scope(session, thread_id, caller)
+            assert bind.value.status_code == 404
+            await session.rollback()
     finally:
         await _drop_thread(maker, thread_id)
 
@@ -154,11 +225,14 @@ async def test_cross_owner_is_not_found(maker: async_sessionmaker) -> None:
 async def test_losing_insert_rolls_back_then_reads_winner(maker: async_sessionmaker) -> None:
     """Two connections, same (tenant, owner, thread, key).
 
-    Proves the recovery order that a mocked session could not: after the
-    IntegrityError the transaction is aborted, so the winner must be read on a
-    NEW transaction started by an explicit rollback. Reading first would raise
-    PendingRollbackError.
+    Proves the recovery order that a mocked session could not: the loser's
+    insert waits on the winner's in-flight tuple and fails with the unique
+    violation once that transaction commits; the loser's transaction is then
+    aborted, so the winner must be read on a NEW transaction started by an
+    explicit rollback. Reading first would raise PendingRollbackError.
     """
+    import asyncio
+
     thread_id, owner, key = "adm-race-1", "adm-user-1", "op-race-1"
     await _seed_thread(maker, thread_id=thread_id, owner=owner, tenant=DEFAULT_TENANT)
     try:
@@ -187,13 +261,21 @@ async def test_losing_insert_rolls_back_then_reads_winner(maker: async_sessionma
                     status="pending",
                 )
             )
-            with pytest.raises(IntegrityError) as caught:
+
+            async def _losing_insert() -> None:
                 await loser_session.flush()
+
+            loser_flush = asyncio.create_task(_losing_insert())
+            # The loser is waiting on the winner's uncommitted tuple; committing
+            # turns that wait into the unique violation it must recover from.
+            await asyncio.sleep(0.2)
+            await winner_session.commit()
+            with pytest.raises(IntegrityError) as caught:
+                await loser_flush
             assert _is_admission_conflict(caught.value), str(caught.value)
 
-            # The loser's transaction is aborted: roll back first.
+            # The loser's transaction is aborted: roll back before reading.
             await loser_session.rollback()
-            await winner_session.commit()
 
             winner = (
                 await loser_session.execute(
@@ -270,43 +352,59 @@ async def test_operation_key_scoped_per_tenant(maker: async_sessionmaker) -> Non
 
 
 async def test_scope_lock_blocks_concurrent_owner_change(maker: async_sessionmaker) -> None:
-    """authorize_thread_scope holds a row lock until its transaction ends.
+    """bind_thread_scope holds a FOR UPDATE lock until its transaction ends.
 
     A plain SELECT would let connection B reassign the thread owner between the
-    authorization read and the run insert (READ COMMITTED). With FOR UPDATE,
-    B blocks until A finishes: proven by the timeout, then the post-commit
-    read shows A's scope, not the racing rewrite.
+    authorization read and the run insert (READ COMMITTED). The unlocked
+    preflight deliberately takes no lock, so the lock has to come from the bind:
+    with FOR UPDATE, B blocks until A ends — proven by the timeout — and the
+    post-commit read shows the racing rewrite landing only after the release.
+
+    Negative control: the same racing write against the unlocked preflight is
+    NOT blocked, so the timeout above cannot pass for free.
     """
     import asyncio
 
-    thread_id, owner = "adm-lock-1", "adm-user-1"
-    await _seed_thread(maker, thread_id=thread_id, owner=owner, tenant=DEFAULT_TENANT)
+    locked_id, unlocked_id, owner = "adm-lock-1", "adm-lock-2", "adm-user-1"
+    await _seed_thread(maker, thread_id=locked_id, owner=owner, tenant=DEFAULT_TENANT)
+    await _seed_thread(maker, thread_id=unlocked_id, owner=owner, tenant=DEFAULT_TENANT)
+    principal = User(identity=owner, tenant_id=DEFAULT_TENANT)
+
+    async def _reassign(session, thread_id: str) -> None:
+        await session.execute(
+            text("update thread set user_id = 'adm-other' where thread_id = :t"), {"t": thread_id}
+        )
+        await session.commit()
+
     try:
         async with maker() as holder, maker() as racer:
-            await authorize_thread_scope(holder, thread_id, User(identity=owner, tenant_id=DEFAULT_TENANT))
+            await bind_thread_scope(holder, locked_id, principal)
 
-            blocked = asyncio.create_task(
-                racer.execute(
-                    text("update thread set user_id = 'adm-other' where thread_id = :t"),
-                    {"t": thread_id},
-                )
-            )
-            await racer.commit()
+            blocked = asyncio.create_task(_reassign(racer, locked_id))
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(blocked), timeout=0.5)
             await holder.commit()
             await asyncio.wait_for(blocked, timeout=5)
 
-        async with maker() as check:
-            scope = (
-                await check.execute(
-                    text("select user_id, tenant_id from thread where thread_id = :t"), {"t": thread_id}
-                )
-            ).one()
-            assert scope[0] == "adm-other"  # racer proceeded only after the lock released
-    finally:
-        await _drop_thread(maker, thread_id)
+        async with maker() as holder, maker() as racer:
+            await authorize_thread_scope(holder, unlocked_id, principal)
+            # No row lock here, so the racing rewrite lands while A is open.
+            await asyncio.wait_for(asyncio.create_task(_reassign(racer, unlocked_id)), timeout=5)
+            await holder.rollback()
 
+        async with maker() as check:
+            scopes = dict(
+                (
+                    await check.execute(
+                        text("select thread_id, user_id from thread where thread_id in (:a, :b)"),
+                        {"a": locked_id, "b": unlocked_id},
+                    )
+                ).all()
+            )
+            assert scopes == {locked_id: "adm-other", unlocked_id: "adm-other"}
+    finally:
+        await _drop_thread(maker, locked_id)
+        await _drop_thread(maker, unlocked_id)
 
 async def test_concurrent_scope_bind_same_thread_does_not_cross_parties(maker: async_sessionmaker) -> None:
     """Two connections bind the same absent thread id under different owners.
@@ -314,22 +412,46 @@ async def test_concurrent_scope_bind_same_thread_does_not_cross_parties(maker: a
     Creation is keyed on the primary key with ON CONFLICT DO NOTHING, so the
     loser never overwrites the winner's owner/tenant; exactly one scope wins.
     """
+    import asyncio
+
     thread_id = "adm-bind-race-1"
+    parties = [
+        User(identity="adm-user-a", tenant_id="tenant-a"),
+        User(identity="adm-user-b", tenant_id="tenant-b"),
+    ]
+    await _drop_thread(maker, thread_id)  # start from a known-absent id
+
+    async def _bind(user: User) -> HTTPException | None:
+        async with maker() as session:
+            try:
+                await bind_thread_scope(session, thread_id, user)
+                await session.commit()
+            except HTTPException as exc:
+                await session.rollback()
+                return exc
+        return None
+
     try:
-        async with maker() as a, maker() as b:
-            await authorize_thread_scope(a, thread_id, User(identity="adm-user-a", tenant_id="tenant-a"))
-            await a.commit()
-            with pytest.raises(HTTPException) as exc:
-                await authorize_thread_scope(b, thread_id, User(identity="adm-user-b", tenant_id="tenant-b"))
-            assert exc.value.status_code == 404
-            await b.rollback()
+        outcomes = await asyncio.gather(*(_bind(user) for user in parties))
+        losers = [exc for exc in outcomes if exc is not None]
+        assert len(losers) == 1, outcomes
+        assert losers[0].status_code == 404
+        winner = parties[outcomes.index(None)]
+
         async with maker() as check:
             scope = (
                 await check.execute(
                     text("select user_id, tenant_id from thread where thread_id = :t"), {"t": thread_id}
                 )
             ).one()
-            assert scope == ("adm-user-a", "tenant-a")
+        assert tuple(scope) == (winner.identity, winner.tenant_id)
+
+        # A re-bind by the loser must not take the row over.
+        async with maker() as session:
+            with pytest.raises(HTTPException) as exc:
+                await bind_thread_scope(session, thread_id, parties[outcomes.index(losers[0])])
+            assert exc.value.status_code == 404
+            await session.rollback()
     finally:
         await _drop_thread(maker, thread_id)
 
@@ -404,8 +526,10 @@ async def test_prune_keep_latest_is_tenant_scoped(maker: async_sessionmaker) -> 
                     user_id=owner,
                     tenant_id="tenant-a",
                 )
-        pruned = [call.args[0] for call in checkpointer.aprune.await_args_list]
+        # aprune receives a one-element list per owned thread: flatten the calls.
+        pruned = [tid for call in checkpointer.aprune.await_args_list for tid in call.args[0]]
         assert pruned == [thread_a], f"keep_latest crossed tenants: {pruned}"
+        assert {call.kwargs["strategy"] for call in checkpointer.aprune.await_args_list} == {"keep_latest"}
         # Compaction keeps both thread rows (only history is pruned).
         async with maker() as check:
             remaining = {
@@ -459,23 +583,29 @@ def _payload(job_from_row: dict) -> dict:
     return job_from_row
 
 
-async def _verify(maker, run_kwargs, params_mutator=None, principal_tenant=None, principal_identity=None):
+async def _verify(maker, run_kwargs, params_mutator=None, principal_tenant=_ROW_TENANT, principal_identity=None):
     """Build one real row + payload, then run the worker verifier on it."""
-    from unittest.mock import AsyncMock, MagicMock
-
     from aegra_api.models.run_job import RunJob
     from aegra_api.services.worker_executor import _verify_run_principal
 
+    # Separate transaction: the fork's ORM declares no relationship between
+    # Thread and Run, so one flush would not order the parent insert first.
+    # Production binds the thread with an immediate INSERT (ON CONFLICT DO
+    # NOTHING) before the admission write, i.e. before this run insert.
+    await _seed_thread(
+        maker,
+        thread_id=run_kwargs["thread_id"],
+        owner=run_kwargs["user_id"],
+        tenant=run_kwargs["tenant_id"],
+    )
+
     async with maker() as session:
-        thread = ThreadORM(
-            thread_id=run_kwargs["thread_id"],
-            user_id=run_kwargs["user_id"],
-            tenant_id=run_kwargs["tenant_id"],
-        )
-        session.add(thread)
+        # Production projects the trusted tenant into the stored principal, so
+        # the default is the row's own tenant; ``None`` means "no claim".
+        tenant_claim = run_kwargs["tenant_id"] if principal_tenant is _ROW_TENANT else principal_tenant
         user_block = {"identity": principal_identity or run_kwargs["user_id"]}
-        if principal_tenant is not None:
-            user_block["tenant_id"] = principal_tenant
+        if tenant_claim is not None:
+            user_block["tenant_id"] = tenant_claim
         params = {
             "graph_id": "agent",
             "user": user_block,
@@ -490,12 +620,11 @@ async def _verify(maker, run_kwargs, params_mutator=None, principal_tenant=None,
             params_mutator(params)
         session.add(RunORM(**run_kwargs, execution_params=params))
         await session.commit()
-
         from sqlalchemy import select as _select
 
         run_orm = await session.scalar(_select(RunORM).where(RunORM.run_id == run_kwargs["run_id"]))
         job = RunJob.from_run_orm(run_orm)
-        reason = await _verify_run_principal(AsyncMock(), run_orm, job)
+        reason = await _verify_run_principal(session, run_orm, job)
         return reason
 
 
@@ -687,29 +816,30 @@ async def test_cron_rows_require_tenant_attribution(maker: async_sessionmaker) -
     """Cron tenant is stored per row; an unattributed row is not 'default'."""
     from aegra_api.core.orm import Cron as CronORM
 
-    async with maker() as session:
-        session.add(
-            CronORM(
-                cron_id="adm-cron-1",
-                assistant_id="adm-cron-assistant",
-                user_id="adm-cron-owner",
-                tenant_id="tenant-a",
-                schedule="*/5 * * * *",
+    assistant_id, owner = "adm-cron-assistant", "adm-cron-owner"
+    await _seed_assistant(maker, assistant_id=assistant_id, owner=owner, tenant="tenant-a")
+    try:
+        async with maker() as session:
+            session.add(
+                CronORM(
+                    cron_id="adm-cron-1",
+                    assistant_id=assistant_id,
+                    user_id=owner,
+                    tenant_id="tenant-a",
+                    schedule="*/5 * * * *",
+                )
             )
-        )
-        # assistant FK may not exist in a bare test DB; tolerate by rolling back
-        try:
+            # The FK is satisfied by the seeded assistant, so the row really lands.
             await session.commit()
-        except IntegrityError:
-            await session.rollback()
-            pytest.skip("assistant FK requires a seeded assistant row in this database")
-        stored = (
-            await session.execute(text("select tenant_id from crons where cron_id = 'adm-cron-1'"))
-        ).scalar_one()
-        assert stored == "tenant-a"
-        await session.execute(text("delete from crons where cron_id = 'adm-cron-1'"))
-        await session.commit()
-
+            stored = (
+                await session.execute(text("select tenant_id from crons where cron_id = 'adm-cron-1'"))
+            ).scalar_one()
+            assert stored == "tenant-a"
+    finally:
+        async with maker() as session:
+            await session.execute(text("delete from crons where cron_id = 'adm-cron-1'"))
+            await session.commit()
+        await _drop_assistant(maker, assistant_id)
 
 # ---------------------------------------------------------------------------
 # Single-tenant config: another tenant cannot touch legacy NULL rows
@@ -781,6 +911,14 @@ async def _assistant_indexes(maker) -> dict[str, str]:
         ).all()
     return {name: ddl for name, ddl in rows}
 
+def _normalise_ddl(ddl: str) -> str:
+    """Squash whitespace and the redundant parens Postgres adds around casts.
+
+    ``md5(config::text)`` round-trips out of ``pg_indexes`` as
+    ``md5((config)::text)``; both are the same index expression.
+    """
+    return re.sub(r"\((\w+)\)(::)", r"\1\2", ddl.replace(" ", ""))
+
 
 async def test_assistant_unique_indexes_are_split_by_tenant(maker) -> None:
     indexes = await _assistant_indexes(maker)
@@ -790,7 +928,7 @@ async def test_assistant_unique_indexes_are_split_by_tenant(maker) -> None:
     assert "idx_assistant_user_assistant_legacy" in indexes
     # The config expression is preserved verbatim in both partitions.
     for name in ("idx_assistant_tenant_user_graph_config", "idx_assistant_user_graph_config_legacy"):
-        assert "md5(config::text)" in indexes[name].replace(" ", ""), indexes[name]
+        assert "md5(config::text)" in _normalise_ddl(indexes[name]), indexes[name]
         assert "tenant_id IS NOT NULL" in indexes[name] or "tenant_id IS NULL" in indexes[name], indexes[name]
     # The owner-wide originals are gone.
     assert "idx_assistant_user_graph_config" not in indexes
