@@ -429,6 +429,84 @@ class _LoadedRun:
         self.trace = trace
 
 
+async def _verify_run_principal(
+    session: AsyncSession, run_orm: RunORM, job: RunJob
+) -> str | None:
+    """Cross-check independent sources of a run's identity before execution.
+
+    Sources that must agree, each read independently:
+
+    * the authoritative run row (``runs.tenant_id`` / ``runs.user_id``);
+    * the persisted payload's admission scope (``execution_params.tenant_id``);
+    * the persisted principal (``execution_params.user.tenant_id`` and
+      ``user.identity``);
+    * the thread row the run points at (``thread.tenant_id`` / ``thread.user_id``).
+
+    ``RunJob.from_run_orm`` deliberately takes the scope from the payload only,
+    so this comparison cannot be satisfied by construction.
+
+    Rows written by this admission code carry ``admission_version`` in the run
+    row (and the payload); anything else predates the migration and is verified
+    with the relaxed legacy contract: the row's tenant is the explicit source
+    and the payload must merely not contradict it. Everything missing or
+    mismatched on an admitted row is refused.
+
+    Returns a short reason string on failure, ``None`` when the run may execute.
+    """
+    is_admitted_row = run_orm.admission_version is not None
+
+    if not is_admitted_row:
+        if job.admission_version is not None or job.operation_key is not None:
+            return "legacy run row carries admission markers in its payload"
+        if job.tenant_id is not None and job.tenant_id != run_orm.tenant_id:
+            return f"legacy payload tenant {job.tenant_id!r} != row tenant {run_orm.tenant_id!r}"
+        payload_user = job.user.model_dump()
+        if payload_user.get("tenant_id") not in (None, run_orm.tenant_id):
+            return (
+                f"legacy payload principal tenant {payload_user.get('tenant_id')!r} "
+                f"!= row tenant {run_orm.tenant_id!r}"
+            )
+        if payload_user.get("identity") != run_orm.user_id:
+            return f"payload principal {payload_user.get('identity')!r} != row owner {run_orm.user_id!r}"
+    else:
+        if job.admission_version != run_orm.admission_version:
+            return f"payload admission version {job.admission_version!r} != row {run_orm.admission_version!r}"
+        if job.operation_key != run_orm.operation_key:
+            return f"payload operation key {job.operation_key!r} != row {run_orm.operation_key!r}"
+        if job.tenant_id != run_orm.tenant_id:
+            return f"payload tenant {job.tenant_id!r} != row tenant {run_orm.tenant_id!r}"
+        payload_user = job.user.model_dump()
+        if payload_user.get("tenant_id") != run_orm.tenant_id:
+            return (
+                f"payload principal tenant {payload_user.get('tenant_id')!r} "
+                f"!= row tenant {run_orm.tenant_id!r}"
+            )
+        if payload_user.get("identity") != run_orm.user_id:
+            return f"payload principal {payload_user.get('identity')!r} != row owner {run_orm.user_id!r}"
+
+    thread_scope = (
+        await session.execute(
+            select(ThreadORM.user_id, ThreadORM.tenant_id).where(ThreadORM.thread_id == run_orm.thread_id)
+        )
+    ).one_or_none()
+    if thread_scope is None:
+        return f"thread {run_orm.thread_id!r} not found"
+    # NULL tenant = pre-attribution row: only acceptable when the deployment is
+    # explicitly single-tenant, and then it must match that one tenant.
+    row_tenant = run_orm.tenant_id
+    if row_tenant is None:
+        single = os.environ.get("AEGRA_SINGLE_TENANT_ID", "").strip()
+        if not single:
+            return "run row has no tenant attribution (legacy row in a multi-tenant deployment)"
+        row_tenant = single
+    if thread_scope[0] != run_orm.user_id or thread_scope[1] not in (row_tenant, None):
+        return (
+            f"thread scope {(thread_scope[0], thread_scope[1])!r} "
+            f"!= run scope {(run_orm.user_id, run_orm.tenant_id)!r}"
+        )
+    return None
+
+
 async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
     """Acquire lease and load job in a single DB session.
 
@@ -475,6 +553,31 @@ async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
             return None
 
         job = RunJob.from_run_orm(run_orm)
+        mismatch = await _verify_run_principal(session, run_orm, job)
+        if mismatch is not None:
+            # The job payload, the persisted principal and the authoritative run
+            # row disagree about who this run belongs to. Refuse to execute: a
+            # queue entry or a tampered payload must never run with another
+            # party's identity, checkpoints or credentials.
+            logger.error(
+                "Refusing run: admission identity verification failed",
+                run_id=run_id,
+                worker=worker_name,
+                reason=mismatch,
+            )
+            await session.execute(
+                update(RunORM)
+                .where(RunORM.run_id == run_id, RunORM.claimed_by == worker_name)
+                .values(
+                    claimed_by=None,
+                    lease_expires_at=None,
+                    status="error",
+                    error_message=f"Run admission identity mismatch: {mismatch}",
+                )
+            )
+            await session.commit()
+            return None
+
         trace = run_orm.execution_params.get("trace", {})
         return _LoadedRun(job=job, trace=trace)
 
