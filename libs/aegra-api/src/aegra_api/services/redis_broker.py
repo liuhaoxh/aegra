@@ -23,9 +23,17 @@ from aegra_api.core.active_runs import active_runs, explicit_run_cancellations
 from aegra_api.core.redis_manager import redis_manager
 from aegra_api.core.serializers import GeneralSerializer
 from aegra_api.models.enums import RunCancellationAction
-from aegra_api.services.base_broker import REPLAY_RETENTION_SECONDS, BaseBrokerManager, BaseRunBroker
+from aegra_api.services.base_broker import (
+    REPLAY_RETENTION_SECONDS,
+    BaseBrokerManager,
+    BaseRunBroker,
+    BrokerEvent,
+    BrokerUnavailable,
+    dedupe_key_for,
+    is_terminal_payload,
+)
 from aegra_api.settings import settings
-from aegra_api.utils import generate_event_id
+from aegra_api.utils import extract_event_sequence, generate_event_id
 
 logger = structlog.getLogger(__name__)
 
@@ -138,15 +146,93 @@ class RedisRunBroker(BaseRunBroker):
                     self._finished = True
 
     async def _cache_event(self, message: str) -> None:
-        """Append the event to the replay buffer and bump the sequence counter."""
+        """Append the event to the replay buffer.
+
+        The sequence number was already allocated by
+        ``allocate_event_id()`` (atomic INCR) before ``put()`` was called, so
+        this pipeline must not increment the counter again: doing so made the
+        counter grow twice per event and left holes in the event ids
+        (1, 3, 5, ...), which the completeness state reads as false gaps.
+        """
         client = redis_manager.get_client()
         pipe = client.pipeline()
         pipe.rpush(self._cache_key, message)
         pipe.ltrim(self._cache_key, -_REPLAY_MAX_EVENTS, -1)
         pipe.expire(self._cache_key, _REPLAY_TTL_SECONDS)
-        pipe.incr(self._counter_key)
         pipe.expire(self._counter_key, _REPLAY_TTL_SECONDS)
         await pipe.execute()
+
+    async def stored_events(self) -> list[BrokerEvent]:
+        """Read the whole retained buffer with per-event identity.
+
+        Identity comes from the stored ``event_id`` (allocated once at publish
+        time), not from the list position: a trimmed or retried write must not
+        renumber already-delivered events. Duplicate adjacent ids come from a
+        legacy cache write and are collapsed — the same event id means the same
+        event.
+        """
+        client = redis_manager.get_client()
+        try:
+            raw_messages = await client.lrange(self._cache_key, 0, -1)
+        except RedisError as exc:
+            raise BrokerUnavailable(f"replay buffer unreadable: {exc}") from exc
+
+        events: list[BrokerEvent] = []
+        previous_id: str | None = None
+        for raw in raw_messages:
+            data = json.loads(raw)
+            event_id = str(data["event_id"])
+            if event_id == previous_id:
+                continue
+            previous_id = event_id
+            payload = _deserialize_payload(data["payload"])
+            events.append(
+                BrokerEvent(
+                    event_id=event_id,
+                    seq=extract_event_sequence(event_id),
+                    dedupe_key=dedupe_key_for(self.run_id, payload),
+                    payload=payload,
+                )
+            )
+        return events
+
+    async def high_water_seq(self) -> int:
+        """Highest sequence ever allocated for this run (Redis counter).
+
+        Read straight from the counter key, so history dropped by LTRIM or TTL
+        is still recognisable as missing instead of looking like an empty run.
+        """
+        client = redis_manager.get_client()
+        try:
+            value = await client.get(self._counter_key)
+        except RedisError as exc:
+            raise BrokerUnavailable(f"sequence watermark unreadable: {exc}") from exc
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError) as exc:
+            raise BrokerUnavailable(f"sequence watermark is not an integer: {value!r}") from exc
+
+    async def put_terminal(self, payload: Any) -> str | None:
+        """Publish the run's terminal event at most once, across instances.
+
+        The claim is an atomic ``SET NX`` on the run's terminal key, so two
+        instances signalling the same state cannot both land an ``end`` event.
+        The event id is allocated only after the claim succeeds, so a loser
+        never burns a sequence number.
+        """
+        if not is_terminal_payload(payload):
+            raise ValueError("put_terminal() requires a terminal ('end', ...) payload")
+        client = redis_manager.get_client()
+        claim_key = f"{self._cache_key}:terminal"
+        try:
+            claimed = await client.set(claim_key, "1", nx=True, ex=_REPLAY_TTL_SECONDS)
+        except RedisError as exc:
+            raise BrokerUnavailable(f"terminal claim failed: {exc}") from exc
+        if not claimed:
+            return None
+        event_id = await self.allocate_event_id(self.run_id)
+        await self.put(event_id, payload)
+        return event_id
 
     async def _publish_event(self, message: str) -> None:
         """Broadcast the event to live subscribers."""

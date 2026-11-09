@@ -6,13 +6,25 @@ from typing import Any
 
 import structlog
 
-from aegra_api.core.sse import create_error_event
+from aegra_api.core.sse import create_error_event, create_stream_state_event
 from aegra_api.models import Run
+from aegra_api.services.base_broker import EventRead, EventStreamState
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.event_converter import EventConverter
 from aegra_api.utils import extract_event_sequence
 
 logger = structlog.getLogger(__name__)
+
+
+def _stream_state_frame(read: EventRead) -> str:
+    """Render the explicit frame for a gap or an unreadable history."""
+    return create_stream_state_event(
+        read.state.value,
+        after_seq=read.after_seq,
+        lost_from_seq=read.lost_from_seq,
+        lost_to_seq=read.lost_to_seq,
+        reason=read.detail,
+    )
 
 
 class StreamingService:
@@ -125,18 +137,24 @@ class StreamingService:
             yield create_error_event({"error": type(e).__name__, "message": "execution failed"})
 
     async def _replay_stored_events(self, run_id: str, last_event_id: str | None) -> AsyncIterator[tuple[str, str]]:
-        """Replay stored events from the broker's replay buffer.
+        """Replay retained events from the broker's typed read face.
 
-        Yields (event_id, sse_event) tuples so the caller can track
-        the highest replayed sequence for live deduplication.
+        Yields (event_id, sse_event) tuples so the caller can track the highest
+        replayed sequence for live deduplication. A read that cannot prove
+        completeness yields one explicit frame first — a client must never
+        receive a silently shortened history that looks complete.
         """
         broker = broker_manager.get_or_create_broker(run_id)
-        stored_events = await broker.replay(last_event_id)
+        cursor = extract_event_sequence(last_event_id) if last_event_id else 0
+        read = await broker.read_events(cursor)
 
-        for event_id, raw_event in stored_events:
-            sse_event = await self._convert_raw_to_sse(event_id, raw_event)
+        if read.state is not EventStreamState.OPEN and read.state is not EventStreamState.END_OF_STREAM:
+            yield "", _stream_state_frame(read)
+
+        for entry in read.events:
+            sse_event = await self._convert_raw_to_sse(entry.event_id, entry.payload)
             if sse_event:
-                yield event_id, sse_event
+                yield entry.event_id, sse_event
 
     async def _stream_live_events(self, run: Run, last_sent_sequence: int) -> AsyncIterator[str]:
         """Stream live events from broker."""

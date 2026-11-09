@@ -25,6 +25,10 @@ htmlcov/
 .pytest_cache/
 .mypy_cache/
 
+# ub-mode 工具生成态（crapper/dryer/mutator/coverage）
+.metrics/
+target/
+
 # Ruff
 .ruff_cache/
 

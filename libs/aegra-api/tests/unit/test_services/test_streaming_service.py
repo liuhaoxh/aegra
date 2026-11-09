@@ -8,7 +8,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aegra_api.models import Run
+from aegra_api.services.base_broker import BrokerEvent, EventRead, EventStreamState
 from aegra_api.services.streaming_service import StreamingService
+from aegra_api.utils import extract_event_sequence
+
+
+def _stored(*events: tuple[str, Any], state: EventStreamState = EventStreamState.OPEN) -> EventRead:
+    """Typed read result for the broker seam (identity comes from the event id)."""
+    return EventRead(
+        events=tuple(
+            BrokerEvent(
+                event_id=event_id,
+                seq=extract_event_sequence(event_id),
+                dedupe_key=event_id,
+                payload=payload,
+            )
+            for event_id, payload in events
+        ),
+        state=state,
+        after_seq=0,
+    )
 
 
 @pytest.mark.asyncio
@@ -184,11 +203,11 @@ class TestStreamingService:
         mock_broker = MagicMock()
         mock_broker.is_finished.return_value = False
         # Replay returns 2 stored events
-        mock_broker.replay = AsyncMock(
-            return_value=[
+        mock_broker.read_events = AsyncMock(
+            return_value=_stored(
                 ("run-123_event_1", ("values", {"a": 1})),
                 ("run-123_event_2", ("values", {"a": 2})),
-            ]
+            )
         )
 
         async def mock_aiter() -> AsyncGenerator[tuple[str, Any], None]:
@@ -208,7 +227,7 @@ class TestStreamingService:
 
             assert len(events) == 4
             assert events == ["sse1", "sse2", "sse3", "sse4"]
-            mock_broker.replay.assert_awaited_with(None)
+            mock_broker.read_events.assert_awaited_with(0)
 
     async def test_stream_run_execution_with_last_id(self) -> None:
         """Test streaming with last_event_id resume"""
@@ -227,7 +246,7 @@ class TestStreamingService:
 
         mock_broker = MagicMock()
         mock_broker.is_finished.return_value = False
-        mock_broker.replay = AsyncMock(return_value=[])
+        mock_broker.read_events = AsyncMock(return_value=_stored())
 
         async def mock_aiter() -> AsyncGenerator[tuple[str, Any], None]:
             if False:
@@ -242,8 +261,8 @@ class TestStreamingService:
             async for _ in service.stream_run_execution(run, last_event_id=last_id):
                 pass
 
-            # Should replay from last_id
-            mock_broker.replay.assert_awaited_with(last_id)
+            # Should replay after the sequence carried by last_id
+            mock_broker.read_events.assert_awaited_with(5)
 
     async def test_stream_skips_already_replayed_events(self) -> None:
         """Test that live events with sequence <= last replayed are skipped"""
@@ -261,7 +280,7 @@ class TestStreamingService:
 
         mock_broker = MagicMock()
         mock_broker.is_finished.return_value = False
-        mock_broker.replay = AsyncMock(return_value=[])
+        mock_broker.read_events = AsyncMock(return_value=_stored())
 
         async def mock_aiter() -> AsyncGenerator[tuple[str, Any], None]:
             # Event with sequence 3 should be skipped (last_event_id was event_5)
@@ -306,11 +325,11 @@ class TestStreamingService:
         mock_broker = MagicMock()
         mock_broker.is_finished.return_value = False
         # Replay returns events after event_4 (the last_event_id)
-        mock_broker.replay = AsyncMock(
-            return_value=[
+        mock_broker.read_events = AsyncMock(
+            return_value=_stored(
                 ("run-123_event_5", ("values", {"a": 5})),
                 ("run-123_event_6", ("values", {"a": 6})),
-            ]
+            )
         )
 
         async def mock_aiter() -> AsyncGenerator[tuple[str, Any], None]:

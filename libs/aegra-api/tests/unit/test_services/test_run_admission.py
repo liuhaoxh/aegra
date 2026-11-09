@@ -527,7 +527,7 @@ def test_unknown_authorization_claim_is_refused_not_dropped() -> None:
     assert "subscription_tier" in str(exc.value)
 
 
-def test_unknown_claim_refusal_reaches_the_caller_as_422(
+async def test_unknown_claim_refusal_reaches_the_caller_as_422(
     _session: AsyncMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_common(monkeypatch)

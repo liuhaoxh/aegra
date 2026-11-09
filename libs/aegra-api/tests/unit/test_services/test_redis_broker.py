@@ -100,10 +100,12 @@ class TestRedisRunBroker:
             assert cache_key == "aegra:run:cache:run-123"
             assert json.loads(cached_msg) == data
 
-            # Should trim, set TTL, and increment counter in pipeline
+            # Trim + TTL only: the sequence number was allocated by
+            # allocate_event_id() before put(), so the cache write must not
+            # increment the counter a second time (that produced id holes).
             mock_pipe.ltrim.assert_called_once()
             mock_pipe.expire.assert_called()
-            mock_pipe.incr.assert_called_once_with("aegra:run:counter:run-123")
+            mock_pipe.incr.assert_not_called()
             mock_pipe.execute.assert_awaited_once()
 
     @pytest.mark.asyncio

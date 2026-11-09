@@ -225,6 +225,34 @@ def create_error_event(error: str | dict[str, Any], event_id: str | None = None)
     return format_sse_message("error", data, event_id)
 
 
+
+def create_stream_state_event(
+    state: str,
+    *,
+    after_seq: int,
+    lost_from_seq: int | None = None,
+    lost_to_seq: int | None = None,
+    reason: str | None = None,
+) -> str:
+    """Create an explicit ``stream_state`` frame for an incomplete history.
+
+    Emitted before any replayed event when the broker cannot prove that the
+    retained history reaches the client's cursor (``gap``) or cannot read it at
+    all (``unavailable``). Consumers must treat this frame as "resync with the
+    server state", never as an empty complete history.
+    """
+    return format_sse_message(
+        "stream_state",
+        {
+            "state": state,
+            "after_seq": after_seq,
+            "lost_from_seq": lost_from_seq,
+            "lost_to_seq": lost_to_seq,
+            "reason": reason,
+        },
+    )
+
+
 def create_messages_event(messages_data: Any, event_type: str = "messages", event_id: str | None = None) -> str:
     """Create messages event (messages, messages/partial, messages/complete, messages/metadata)"""
     # Handle tuple format for token streaming: (message_chunk, metadata)
