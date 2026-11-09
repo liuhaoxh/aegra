@@ -42,6 +42,7 @@ from aegra_api.models import (
 )
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, AgentProtocolError
 from aegra_api.models.search_limit import effective_search_limit
+from aegra_api.services.run_preparation import tenant_scope, trusted_identity
 from aegra_api.services.streaming_service import streaming_service
 from aegra_api.services.thread_state_service import ThreadStateService
 from aegra_api.services.thread_ttl import get_thread_ttl_config, prune_expired_threads_for_user, prune_threads_by_id
@@ -58,7 +59,7 @@ async def _get_thread_graph_id(thread_id: str, user: User) -> str | None:
     """Resolve graph_id via a short-lived session, so the caller's checkpoint ops hold no pool connection."""
     maker = _get_session_maker()
     async with maker() as session:
-        stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
         thread = await session.scalar(stmt)
         if not thread:
             raise HTTPException(404, f"Thread '{thread_id}' not found")
@@ -256,6 +257,10 @@ async def create_thread(
             status="idle",
             metadata_json=metadata,
             user_id=user.identity,
+            # Trusted tenant, not the DB default: otherwise a non-default
+            # tenant's thread lands in 'default' and a same-owner principal in
+            # another tenant could take it over.
+            tenant_id=trusted_identity(user)[0],
         )
         .on_conflict_do_nothing(index_elements=["thread_id"])
         .returning(ThreadORM)
@@ -278,7 +283,7 @@ async def create_thread(
     existing = await session.scalar(
         select(ThreadORM).where(
             ThreadORM.thread_id == thread_id,
-            ThreadORM.user_id == user.identity,
+            ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]),
         )
     )
 
@@ -302,7 +307,7 @@ async def list_threads(
     value = {}
     filters = await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity)
+    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
     if auth_filter is not None:
         stmt = stmt.where(auth_filter)
@@ -330,7 +335,7 @@ async def get_thread(
     value = {"thread_id": thread_id}
     filters = await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
     # A by-id lookup must honor the same filter as search, or a handler that
     # scopes listings still leaks the row to anyone who knows the id.
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
@@ -372,7 +377,7 @@ async def update_thread(
     # This read is the 404 probe and the ownership check; the merge below does
     # not read the column into Python, so it cannot lose a concurrent writer's
     # keys no matter how long this request takes.
-    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
     thread = await session.scalar(stmt)
 
     if not thread:
@@ -386,7 +391,7 @@ async def update_thread(
 
     await session.execute(
         update(ThreadORM)
-        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        .where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
         .values(**values)
         .execution_options(synchronize_session=False)
     )
@@ -883,7 +888,7 @@ async def delete_thread(
     value = {"thread_id": thread_id}
     filters = await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+    stmt = select(ThreadORM).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
     # Deleting by id must respect the handler filter too, or a scoped handler
     # blocks listing a thread while still allowing its deletion.
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
@@ -939,8 +944,12 @@ async def prune_threads(
     filters = await handle_event(ctx, {"thread_ids": request.thread_ids} if request else {})
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)
 
+    tenant_id, _owner_id = trusted_identity(user)
+
     if request is None:
-        deleted, pruned = await prune_expired_threads_for_user(session, user_id=user.identity, auth_filter=auth_filter)
+        deleted, pruned = await prune_expired_threads_for_user(
+            session, user_id=user.identity, tenant_id=tenant_id, auth_filter=auth_filter
+        )
         return ThreadPruneResponse(pruned_count=deleted + pruned, deleted=deleted, pruned=pruned)
 
     count = await prune_threads_by_id(
@@ -948,6 +957,7 @@ async def prune_threads(
         thread_ids=request.thread_ids,
         strategy=request.strategy,
         user_id=user.identity,
+        tenant_id=tenant_id,
         auth_filter=auth_filter,
     )
     if request.strategy == "delete":
@@ -971,7 +981,7 @@ async def search_threads(
     value = request.model_dump()
     filters = await handle_event(ctx, value)
 
-    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity)
+    stmt = select(ThreadORM).where(ThreadORM.user_id == user.identity, tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]))
     # Compile the handler filter rather than merging only its "metadata" key:
     # the flat shape and the $eq/$contains/$or/$and operators were dropped here.
     auth_filter = build_metadata_filter(ThreadORM.metadata_json, filters)

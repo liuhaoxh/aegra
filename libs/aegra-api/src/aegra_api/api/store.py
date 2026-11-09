@@ -9,6 +9,7 @@ from fastapi.responses import Response
 
 from aegra_api.config import load_store_config
 from aegra_api.core.auth_deps import auth_dependency, get_current_user
+from aegra_api.services.run_preparation import trusted_identity
 from aegra_api.core.auth_handlers import build_auth_context, handle_event
 from aegra_api.core.database import db_manager
 from aegra_api.models import (
@@ -310,4 +311,10 @@ def apply_namespace_scoping(
             values.append(str(value))
         return _scope(prefix, values, namespace)
 
-    return _scope(_USER_SCOPE_PREFIX, [user.identity], namespace)
+    # Tenant is part of the user scope: identity alone is not a tenant boundary,
+    # so a same-owner principal in another tenant would otherwise share this
+    # namespace. Legacy items live under the identity-only scope; they are
+    # reachable only when the deployment declares one tenant, and even then only
+    # for that tenant's principals (see run_preparation.trusted_identity).
+    tenant_id, owner_id = trusted_identity(user)
+    return _scope(_USER_SCOPE_PREFIX, [tenant_id, owner_id], namespace)

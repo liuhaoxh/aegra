@@ -30,17 +30,41 @@ _background_cleanup_tasks: set[asyncio.Task[None]] = set()
 _CLEANUP_ERRORS: tuple[type[BaseException], ...] = (RedisError, SQLAlchemyError, OSError, PsycopgError)
 
 
-async def delete_thread_by_id(thread_id: str, user_id: str) -> None:
+async def resolve_thread_tenant(thread_id: str, owner_id: str) -> str | None:
+    """The tenant of a thread, from the authoritative row (system-task callers).
+
+    Background/system tasks have no request principal to supply a trusted
+    tenant. They must not fall back to owner-only matching, so they take the
+    tenant from the thread row itself — a verifiable source — and treat a
+    missing row as "nothing to do".
+    """
+    maker = _get_session_maker()
+    async with maker() as session:
+        row = (
+            await session.execute(
+                select(ThreadORM.tenant_id).where(
+                    ThreadORM.thread_id == thread_id, ThreadORM.user_id == owner_id
+                )
+            )
+        ).one_or_none()
+    return row[0] if row is not None else None
+
+
+async def delete_thread_by_id(thread_id: str, user_id: str, tenant_id: str) -> None:
     """Delete an ephemeral thread and cascade-delete its runs.
 
     Opens its own DB session so it can be called after the request session has
-    been closed (e.g. in a finally block or background task).
+    been closed (e.g. in a finally block or background task). ``tenant_id`` is
+    the trusted tenant of the principal that initiated the deletion; it scopes
+    both the active-run scan and the final delete so a same-owner cross-tenant
+    thread is never removed.
     """
     maker = _get_session_maker()
     async with maker() as session:
         active_runs_stmt = select(RunORM).where(
             RunORM.thread_id == thread_id,
             RunORM.user_id == user_id,
+            RunORM.tenant_id == tenant_id,
             RunORM.status.in_(["pending", "running"]),
         )
         active_runs_list = (await session.scalars(active_runs_stmt)).all()
@@ -63,6 +87,7 @@ async def delete_thread_by_id(thread_id: str, user_id: str) -> None:
             select(ThreadORM).where(
                 ThreadORM.thread_id == thread_id,
                 ThreadORM.user_id == user_id,
+                ThreadORM.tenant_id == tenant_id,
             )
         )
         if thread:
@@ -72,7 +97,9 @@ async def delete_thread_by_id(thread_id: str, user_id: str) -> None:
             await session.commit()
 
 
-async def cleanup_after_background_run(run_id: str, thread_id: str, user_id: str) -> None:
+async def cleanup_after_background_run(
+    run_id: str, thread_id: str, user_id: str, tenant_id: str
+) -> None:
     """Wait for a background run to finish, then delete its ephemeral thread.
 
     executor.wait_for_completion works both in-process (dev) and cross-instance
@@ -88,14 +115,16 @@ async def cleanup_after_background_run(run_id: str, thread_id: str, user_id: str
         logger.exception("Error waiting for background run", run_id=run_id)
 
     try:
-        await delete_thread_by_id(thread_id, user_id)
+        await delete_thread_by_id(thread_id, user_id, tenant_id)
     except _CLEANUP_ERRORS:
         logger.exception("Failed to delete ephemeral thread", thread_id=thread_id, run_id=run_id)
 
 
-def schedule_background_cleanup(run_id: str, thread_id: str, user_id: str) -> asyncio.Task[None]:
+def schedule_background_cleanup(
+    run_id: str, thread_id: str, user_id: str, tenant_id: str
+) -> asyncio.Task[None]:
     """Fire-and-forget background cleanup, strong ref held until done."""
-    task = asyncio.create_task(cleanup_after_background_run(run_id, thread_id, user_id))
+    task = asyncio.create_task(cleanup_after_background_run(run_id, thread_id, user_id, tenant_id))
     _background_cleanup_tasks.add(task)
     task.add_done_callback(_background_cleanup_tasks.discard)
     return task

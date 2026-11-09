@@ -29,6 +29,7 @@ from aegra_api.core.orm import _get_session_maker
 from aegra_api.core.sse import format_sse_message, get_sse_headers, make_sse_response, sse_to_bytes
 from aegra_api.models import User
 from aegra_api.models.event_streaming import EventStreamRequest, ThreadCommand
+from aegra_api.services.run_preparation import tenant_scope, trusted_identity
 from aegra_api.services.event_streaming.capabilities import get_v2_capabilities
 from aegra_api.services.event_streaming.commands import handle_command
 from aegra_api.services.event_streaming.session import RunLister, ThreadEventSession, validate_channels
@@ -45,8 +46,12 @@ async def _verify_thread_owned_or_new(session: AsyncSession, thread_id: str, use
     create it (run preparation does, owned by the caller). So a missing
     thread is fine here; an existing thread owned by another user is 404.
     """
-    existing_owner = await session.scalar(select(ThreadORM.user_id).where(ThreadORM.thread_id == thread_id))
-    if existing_owner is not None and existing_owner != user.identity:
+    row = (
+        await session.execute(
+            select(ThreadORM.user_id, ThreadORM.tenant_id).where(ThreadORM.thread_id == thread_id)
+        )
+    ).one_or_none()
+    if row is not None and (row[0] != user.identity or row[1] != trusted_identity(user)[0]):
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
 
@@ -68,7 +73,11 @@ def _thread_run_lister(thread_id: str, user: User) -> RunLister:
                 rows = await session.execute(
                     select(RunORM.run_id, RunORM.status, AssistantORM.graph_id)
                     .outerjoin(AssistantORM, RunORM.assistant_id == AssistantORM.assistant_id)
-                    .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
+                    .where(
+                        RunORM.thread_id == thread_id,
+                        RunORM.user_id == user.identity,
+                        tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
+                    )
                     .order_by(RunORM.created_at.asc())
                 )
                 return [(run_id, status, graph_id) for run_id, status, graph_id in rows.all()]

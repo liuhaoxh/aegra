@@ -24,7 +24,7 @@ from aegra_api.models import Run, RunCreate, RunsCancel, RunStatus, User
 from aegra_api.models.enums import RunCancellationAction
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.broker import broker_manager
-from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.run_preparation import _prepare_run, tenant_scope, trusted_identity
 from aegra_api.services.run_status import interrupt_unowned_run
 from aegra_api.services.run_waiters import TERMINAL_STATES, encode_output, heartbeat_wait_body, run_result_body
 from aegra_api.services.streaming_service import streaming_service
@@ -123,7 +123,7 @@ async def create_run(
     human-in-the-loop resumption) but not both.
     """
     existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
-    if existing_thread and existing_thread.user_id != user.identity:
+    if existing_thread and (existing_thread.user_id != user.identity or existing_thread.tenant_id != trusted_identity(user)[0]):
         raise HTTPException(404, f"Thread '{thread_id}' not found")
 
     await _apply_create_run_auth(user, thread_id, request)
@@ -156,7 +156,9 @@ async def create_and_stream_run(
     maker = _get_session_maker()
     async with maker() as session:
         existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
-        if existing_thread and existing_thread.user_id != user.identity:
+        if existing_thread and (
+            existing_thread.user_id != user.identity or existing_thread.tenant_id != trusted_identity(user)[0]
+        ):
             raise HTTPException(404, f"Thread '{thread_id}' not found")
 
         await _apply_create_run_auth(user, thread_id, request)
@@ -212,7 +214,7 @@ async def get_run(
     stmt = select(RunORM).where(
         RunORM.run_id == str(run_id),
         RunORM.thread_id == thread_id,
-        RunORM.user_id == user.identity,
+        RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
     )
     logger.info(f"[get_run] querying DB run_id={run_id} thread_id={thread_id} user={user.identity}")
     run_orm = await session.scalar(stmt)
@@ -249,7 +251,7 @@ async def list_runs(
         select(RunORM)
         .where(
             RunORM.thread_id == thread_id,
-            RunORM.user_id == user.identity,
+            RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
             *([RunORM.status == status] if status else []),
         )
         .limit(limit)
@@ -284,7 +286,7 @@ async def update_run(
         select(RunORM).where(
             RunORM.run_id == str(run_id),
             RunORM.thread_id == thread_id,
-            RunORM.user_id == user.identity,
+            RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
         )
     )
     if not run_orm:
@@ -336,7 +338,7 @@ async def join_run(
             select(RunORM).where(
                 RunORM.run_id == str(run_id),
                 RunORM.thread_id == thread_id,
-                RunORM.user_id == user.identity,
+                RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
             )
         )
         if not run_orm:
@@ -388,7 +390,7 @@ async def wait_for_run(
     # Session block: all pre-execution DB work (validate, create run, submit)
     async with maker() as session:
         existing_thread = await session.scalar(select(ThreadORM).where(ThreadORM.thread_id == thread_id))
-        if existing_thread and existing_thread.user_id != user.identity:
+        if existing_thread and (existing_thread.user_id != user.identity or existing_thread.tenant_id != trusted_identity(user)[0]):
             raise HTTPException(404, f"Thread '{thread_id}' not found")
 
         await _apply_create_run_auth(user, thread_id, request)
@@ -436,7 +438,7 @@ async def stream_run(
             select(RunORM).where(
                 RunORM.run_id == str(run_id),
                 RunORM.thread_id == thread_id,
-                RunORM.user_id == user.identity,
+                RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
             )
         )
         if not run_orm:
@@ -519,7 +521,7 @@ async def cancel_run_endpoint(
         select(RunORM).where(
             RunORM.run_id == run_id,
             RunORM.thread_id == thread_id,
-            RunORM.user_id == user.identity,
+            RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
         )
     )
     if not run_orm:
@@ -560,14 +562,16 @@ async def cancel_runs(
     Runs the caller does not own or that already finished are skipped. The
     thread must exist for the run_ids form; unknown run ids are ignored.
     """
-    stmt = select(RunORM).where(RunORM.user_id == user.identity)
+    stmt = select(RunORM).where(RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]))
     if request.status is not None:
         active = ["pending", "running"] if request.status == "all" else [request.status]
         stmt = stmt.where(RunORM.status.in_(active))
     else:
         thread_exists = await session.scalar(
             select(ThreadORM.thread_id).where(
-                ThreadORM.thread_id == request.thread_id, ThreadORM.user_id == user.identity
+                ThreadORM.thread_id == request.thread_id,
+                ThreadORM.user_id == user.identity,
+                tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]),
             )
         )
         if not thread_exists:
@@ -614,7 +618,7 @@ async def delete_run(
         select(RunORM).where(
             RunORM.run_id == str(run_id),
             RunORM.thread_id == thread_id,
-            RunORM.user_id == user.identity,
+            RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
         )
     )
     if not run_orm:
@@ -642,7 +646,7 @@ async def delete_run(
         delete(RunORM).where(
             RunORM.run_id == str(run_id),
             RunORM.thread_id == thread_id,
-            RunORM.user_id == user.identity,
+            RunORM.user_id == user.identity, tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
         )
     )
     await session.commit()

@@ -24,7 +24,7 @@ from aegra_api.core.orm import Thread as ThreadORM
 from aegra_api.models import User
 from aegra_api.models.runs import RunCreate
 from aegra_api.services.event_streaming.protocol import ErrorCode, build_error, build_success
-from aegra_api.services.run_preparation import _prepare_run
+from aegra_api.services.run_preparation import _prepare_run, tenant_scope, trusted_identity
 
 logger = structlog.getLogger(__name__)
 
@@ -209,7 +209,11 @@ async def _run_start(
 
 async def _thread_is_interrupted(session: AsyncSession, thread_id: str, user: User) -> bool:
     status = await session.scalar(
-        select(ThreadORM.status).where(ThreadORM.thread_id == thread_id, ThreadORM.user_id == user.identity)
+        select(ThreadORM.status).where(
+            ThreadORM.thread_id == thread_id,
+            ThreadORM.user_id == user.identity,
+            tenant_scope(ThreadORM.tenant_id, trusted_identity(user)[0]),
+        )
     )
     return status == "interrupted"
 
@@ -328,7 +332,11 @@ async def _thread_assistant_id(session: AsyncSession, thread_id: str, user: User
     """The assistant bound to the thread's most recent run, user-scoped."""
     return await session.scalar(
         select(RunORM.assistant_id)
-        .where(RunORM.thread_id == thread_id, RunORM.user_id == user.identity)
+        .where(
+            RunORM.thread_id == thread_id,
+            RunORM.user_id == user.identity,
+            tenant_scope(RunORM.tenant_id, trusted_identity(user)[0]),
+        )
         .order_by(RunORM.created_at.desc())
         .limit(1)
     )

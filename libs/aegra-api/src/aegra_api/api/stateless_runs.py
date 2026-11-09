@@ -27,6 +27,7 @@ from aegra_api.core.sse import make_sse_response
 from aegra_api.models import Run, RunCreate, User
 from aegra_api.models.errors import CONFLICT, NOT_FOUND, SSE_RESPONSE
 from aegra_api.services.broker import broker_manager
+from aegra_api.services.run_preparation import trusted_identity
 from aegra_api.services.run_cleanup import (
     _CLEANUP_ERRORS,
     _background_cleanup_tasks,
@@ -103,17 +104,23 @@ def _extract_run_id_from_headers(headers: Mapping[str, str]) -> str | None:
     return None
 
 
-async def _delete_thread_with_log(thread_id: str, user_id: str, *, reason: str) -> None:
+async def _delete_thread_with_log(
+    thread_id: str, user_id: str, tenant_id: str, *, reason: str
+) -> None:
     """Delete an ephemeral thread, logging infra failures."""
     try:
-        await delete_thread_by_id(thread_id, user_id)
+        await delete_thread_by_id(thread_id, user_id, tenant_id)
     except _CLEANUP_ERRORS:
         logger.exception(reason, thread_id=thread_id)
 
 
-def _schedule_thread_cleanup(thread_id: str, user_id: str, *, reason: str) -> None:
+def _schedule_thread_cleanup(
+    thread_id: str, user_id: str, tenant_id: str, *, reason: str
+) -> None:
     """Fire-and-forget delete keyed off ``_background_cleanup_tasks``."""
-    task = asyncio.create_task(_delete_thread_with_log(thread_id, user_id, reason=reason))
+    task = asyncio.create_task(
+        _delete_thread_with_log(thread_id, user_id, tenant_id, reason=reason)
+    )
     _background_cleanup_tasks.add(task)
     task.add_done_callback(_background_cleanup_tasks.discard)
 
@@ -142,7 +149,7 @@ async def stateless_wait_for_run(
     except Exception:
         if should_delete:
             try:
-                await delete_thread_by_id(thread_id, user.identity)
+                await delete_thread_by_id(thread_id, user.identity, trusted_identity(user)[0])
             except _CLEANUP_ERRORS:
                 logger.exception(
                     "Failed to delete ephemeral thread after wait error",
@@ -175,7 +182,7 @@ async def stateless_wait_for_run(
                 await aclose()
             if completed:
                 await _delete_thread_with_log(
-                    thread_id, user.identity, reason="Failed to delete ephemeral thread after wait"
+                    thread_id, user.identity, trusted_identity(user)[0], reason="Failed to delete ephemeral thread after wait"
                 )
             else:
                 logger.info(
@@ -212,7 +219,7 @@ async def stateless_stream_run(
         # update_thread_metadata before raising; clean up to avoid orphans.
         if should_delete:
             try:
-                await delete_thread_by_id(thread_id, user.identity)
+                await delete_thread_by_id(thread_id, user.identity, trusted_identity(user)[0])
             except _CLEANUP_ERRORS:
                 logger.exception(
                     "Failed to delete ephemeral thread after stream setup error",
@@ -244,7 +251,7 @@ async def stateless_stream_run(
                 await aclose()
             if completed:
                 await _delete_thread_with_log(
-                    thread_id, user.identity, reason="Failed to delete ephemeral thread after stream"
+                    thread_id, user.identity, trusted_identity(user)[0], reason="Failed to delete ephemeral thread after stream"
                 )
             elif run_id is not None and _run_finished(run_id):
                 # Slow-client / dead-proxy abort after the run already
@@ -253,6 +260,7 @@ async def stateless_stream_run(
                 _schedule_thread_cleanup(
                     thread_id,
                     user.identity,
+                    trusted_identity(user)[0],
                     reason="Failed to delete ephemeral thread after slow-client abort",
                 )
             else:
@@ -294,7 +302,7 @@ async def stateless_create_run(
         # update_thread_metadata before raising; clean up to avoid orphans.
         if should_delete:
             try:
-                await delete_thread_by_id(thread_id, user.identity)
+                await delete_thread_by_id(thread_id, user.identity, trusted_identity(user)[0])
             except _CLEANUP_ERRORS:
                 logger.exception(
                     "Failed to delete ephemeral thread after create error",
@@ -303,6 +311,8 @@ async def stateless_create_run(
         raise
 
     if should_delete:
-        schedule_background_cleanup(result.run_id, thread_id, user.identity)
+        schedule_background_cleanup(
+            result.run_id, thread_id, user.identity, trusted_identity(user)[0]
+        )
 
     return result

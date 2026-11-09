@@ -94,7 +94,13 @@ async def _prune_checkpoint_history(thread_id: str) -> bool:
 
 
 async def _apply_strategy(
-    session: AsyncSession, *, thread_id: str, strategy: str, ttl_minutes: float, now: datetime
+    session: AsyncSession,
+    *,
+    thread_id: str,
+    strategy: str,
+    ttl_minutes: float,
+    now: datetime,
+    tenant_id: str | None = None,
 ) -> str:
     """Apply one expired row's strategy inside the claim transaction; return the outcome label."""
     if strategy == "keep_latest":
@@ -110,7 +116,12 @@ async def _apply_strategy(
     # Checkpoints first — ordering rationale from the delete_thread route: a
     # failure here leaves the thread row intact and retryable, never orphans.
     await db_manager.get_checkpointer().adelete_thread(thread_id)
-    await session.execute(delete(ThreadORM).where(ThreadORM.thread_id == thread_id))
+    # tenant_id is the scope the row was claimed under (None only for the
+    # global background sweep, which deliberately spans tenants).
+    delete_stmt = delete(ThreadORM).where(ThreadORM.thread_id == thread_id)
+    if tenant_id is not None:
+        delete_stmt = delete_stmt.where(ThreadORM.tenant_id == tenant_id)
+    await session.execute(delete_stmt)
     return "deleted"
 
 
@@ -119,6 +130,7 @@ def _expired_claim_stmt(
     now: datetime,
     limit: int,
     user_id: str | None = None,
+    tenant_id: str | None = None,
     auth_filter: ColumnElement[bool] | None = None,
     exclude_ids: Collection[str] = (),
 ) -> Select[tuple[str, str, float]]:
@@ -148,7 +160,11 @@ def _expired_claim_stmt(
         )
     )
     if user_id is not None:
-        stmt = stmt.where(ThreadORM.user_id == user_id)
+        # Caller-scoped prune: identity alone is not a tenant boundary, so a
+        # tenant-scoped caller MUST pass the trusted tenant.
+        if tenant_id is None:
+            raise ValueError("tenant_id is required when pruning for a user")
+        stmt = stmt.where(ThreadORM.user_id == user_id, ThreadORM.tenant_id == tenant_id)
         if auth_filter is not None:
             stmt = stmt.where(auth_filter)
     if exclude_ids:
@@ -204,6 +220,7 @@ async def prune_expired_threads_for_user(
     session: AsyncSession,
     *,
     user_id: str,
+    tenant_id: str,
     auth_filter: ColumnElement[bool] | None = None,
 ) -> tuple[int, int]:
     """Immediately apply TTL strategies to the caller's expired threads.
@@ -219,7 +236,14 @@ async def prune_expired_threads_for_user(
     while claimed_total < config.sweep_limit:
         now = datetime.now(UTC)
         limit = min(_CLAIM_BATCH, config.sweep_limit - claimed_total)
-        stmt = _expired_claim_stmt(now=now, limit=limit, user_id=user_id, auth_filter=auth_filter, exclude_ids=failed)
+        stmt = _expired_claim_stmt(
+            now=now,
+            limit=limit,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            auth_filter=auth_filter,
+            exclude_ids=failed,
+        )
         claimed, deleted, pruned, failed_ids = await _process_expired_batch(session, stmt, now)
         if claimed == 0:
             break
@@ -236,6 +260,7 @@ async def prune_threads_by_id(
     thread_ids: Sequence[str],
     strategy: Literal["delete", "keep_latest"],
     user_id: str,
+    tenant_id: str,
     auth_filter: ColumnElement[bool] | None = None,
 ) -> int:
     """Apply a prune strategy to the caller's named threads now; return how many were pruned.
@@ -248,7 +273,10 @@ async def prune_threads_by_id(
         .exists()
     )
     stmt = select(ThreadORM.thread_id).where(
-        ThreadORM.thread_id.in_(thread_ids), ThreadORM.user_id == user_id, ~active_runs_exist
+        ThreadORM.thread_id.in_(thread_ids),
+        ThreadORM.user_id == user_id,
+        ThreadORM.tenant_id == tenant_id,
+        ~active_runs_exist,
     )
     if auth_filter is not None:
         stmt = stmt.where(auth_filter)
@@ -258,7 +286,9 @@ async def prune_threads_by_id(
 
     if strategy == "delete":
         await db_manager.get_checkpointer().aprune(owned, strategy="delete")
-        await session.execute(delete(ThreadORM).where(ThreadORM.thread_id.in_(owned)))
+        await session.execute(
+            delete(ThreadORM).where(ThreadORM.thread_id.in_(owned), ThreadORM.tenant_id == tenant_id)
+        )
         await session.commit()
         return len(owned)
 

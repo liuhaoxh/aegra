@@ -22,7 +22,7 @@ from uuid import uuid4
 from fastapi import Depends, HTTPException
 from langchain_core.runnables.utils import create_model
 from pydantic import TypeAdapter
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +34,7 @@ from aegra_api.core.orm import get_session
 from aegra_api.models import Assistant, AssistantCreate, AssistantUpdate
 from aegra_api.models.auth import User
 from aegra_api.services.authenticated import Authenticated
+from aegra_api.services.run_preparation import tenant_scope, trusted_identity
 from aegra_api.services.langgraph_service import LangGraphService, get_langgraph_service
 
 
@@ -153,6 +154,10 @@ class AssistantService(Authenticated):
 
     resource = "assistants"
 
+    def _tenant_id(self) -> str:
+        """Trusted tenant of the caller; the single source for every ACL below."""
+        return trusted_identity(self.user)[0]
+
     def __init__(self, session: AsyncSession, user: User, langgraph_service: LangGraphService):
         super().__init__(session, user)
         self.langgraph_service = langgraph_service
@@ -176,7 +181,7 @@ class AssistantService(Authenticated):
 
         # Validate graph can be loaded
         try:
-            await self.langgraph_service.get_graph_for_validation(graph_id)
+            await self.langgraph_service.get_graph_for_validation(graph_id, user=self.user)
         except Exception as e:
             raise HTTPException(400, f"Failed to load graph: {str(e)}") from e
 
@@ -215,6 +220,7 @@ class AssistantService(Authenticated):
                 context=context,
                 graph_id=graph_id,
                 user_id=self.user.identity,
+                tenant_id=self._tenant_id(),
                 metadata_dict=metadata,
                 version=1,
             )
@@ -259,6 +265,10 @@ class AssistantService(Authenticated):
         existing = await self.session.scalar(
             select(AssistantORM).where(
                 AssistantORM.user_id == self.user.identity,
+                # Same owner in another tenant is a different party: without this
+                # filter a (graph, config) collision would hand tenant A's row to
+                # tenant B as an if_exists=do_nothing replay.
+                tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
                 or_(
                     (AssistantORM.graph_id == graph_id) & (AssistantORM.config == config),
                     AssistantORM.assistant_id == assistant_id,
@@ -282,7 +292,13 @@ class AssistantService(Authenticated):
         filters = await self._dispatch("search", value)
 
         stmt = select(AssistantORM).where(
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system")
+            or_(
+                and_(
+                    AssistantORM.user_id == self.user.identity,
+                    tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
+                ),
+                AssistantORM.user_id == "system",
+            )
         )
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
@@ -302,7 +318,13 @@ class AssistantService(Authenticated):
         filters = await self._dispatch("search", value)
 
         stmt = select(AssistantORM).where(
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system")
+            or_(
+                and_(
+                    AssistantORM.user_id == self.user.identity,
+                    tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
+                ),
+                AssistantORM.user_id == "system",
+            )
         )
 
         if request.name:
@@ -341,7 +363,13 @@ class AssistantService(Authenticated):
 
         # Include both user's assistants and system assistants (like search_assistants does)
         stmt = select(func.count()).where(
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system")
+            or_(
+                and_(
+                    AssistantORM.user_id == self.user.identity,
+                    tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
+                ),
+                AssistantORM.user_id == "system",
+            )
         )
 
         if request.name:
@@ -374,7 +402,13 @@ class AssistantService(Authenticated):
 
         stmt = select(AssistantORM).where(
             AssistantORM.assistant_id == assistant_id,
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"),
+            or_(
+                and_(
+                    AssistantORM.user_id == self.user.identity,
+                    tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
+                ),
+                AssistantORM.user_id == "system",
+            ),
         )
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
@@ -412,7 +446,7 @@ class AssistantService(Authenticated):
 
         stmt = select(AssistantORM).where(
             AssistantORM.assistant_id == assistant_id,
-            AssistantORM.user_id == self.user.identity,
+            AssistantORM.user_id == self.user.identity, tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
         )
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
@@ -481,7 +515,7 @@ class AssistantService(Authenticated):
             update(AssistantORM)
             .where(
                 AssistantORM.assistant_id == assistant_id,
-                AssistantORM.user_id == self.user.identity,
+                AssistantORM.user_id == self.user.identity, tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
             )
             .values(
                 name=new_version_details["name"],
@@ -505,7 +539,7 @@ class AssistantService(Authenticated):
 
         stmt = select(AssistantORM).where(
             AssistantORM.assistant_id == assistant_id,
-            AssistantORM.user_id == self.user.identity,
+            AssistantORM.user_id == self.user.identity, tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
         )
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
@@ -526,7 +560,7 @@ class AssistantService(Authenticated):
 
         stmt = select(AssistantORM).where(
             AssistantORM.assistant_id == assistant_id,
-            AssistantORM.user_id == self.user.identity,
+            AssistantORM.user_id == self.user.identity, tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
         )
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
@@ -547,7 +581,7 @@ class AssistantService(Authenticated):
             update(AssistantORM)
             .where(
                 AssistantORM.assistant_id == assistant_id,
-                AssistantORM.user_id == self.user.identity,
+                AssistantORM.user_id == self.user.identity, tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
             )
             .values(
                 name=assistant_version.name,
@@ -573,7 +607,13 @@ class AssistantService(Authenticated):
 
         stmt = select(AssistantORM).where(
             AssistantORM.assistant_id == assistant_id,
-            or_(AssistantORM.user_id == self.user.identity, AssistantORM.user_id == "system"),
+            or_(
+                and_(
+                    AssistantORM.user_id == self.user.identity,
+                    tenant_scope(AssistantORM.tenant_id, self._tenant_id()),
+                ),
+                AssistantORM.user_id == "system",
+            ),
         )
         auth_filter = build_metadata_filter(AssistantORM.metadata_dict, filters)
         if auth_filter is not None:
@@ -603,6 +643,7 @@ class AssistantService(Authenticated):
                 context=v.context or {},
                 graph_id=v.graph_id,
                 user_id=self.user.identity,
+                tenant_id=self._tenant_id(),
                 version=v.version,
                 created_at=v.created_at,
                 updated_at=v.created_at,

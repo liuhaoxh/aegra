@@ -172,6 +172,16 @@ class CronScheduler:
         run_created = False
 
         # Liveness check: refuse to forge a User for a deleted/revoked identity.
+        tenant_id = cron.tenant_id
+        if tenant_id is None:
+            # Pre-attribution cron row: its tenant cannot be proven, so firing it
+            # could run under the wrong tenant. Fail closed and say so.
+            logger.error(
+                "Skipping cron with no tenant attribution (legacy row, fail-closed)",
+                cron_id=cron.cron_id,
+                user_id=cron.user_id,
+            )
+            return
         if not await _validate_cron_user(cron.user_id):
             logger.warning(
                 "Disabling cron because the owning user failed liveness check",
@@ -205,7 +215,7 @@ class CronScheduler:
             run_created = True
             logger.info("Cron fired run", cron_id=cron.cron_id, run_id=_run_id, thread_id=thread_id)
             if should_delete_thread:
-                schedule_background_cleanup(_run_id, thread_id, cron.user_id)
+                schedule_background_cleanup(_run_id, thread_id, cron.user_id, tenant_id)
         except HTTPException as exc:
             logger.error(
                 "Cron run creation failed",
@@ -235,7 +245,7 @@ class CronScheduler:
     async def _cleanup_failed_stateless_thread(thread_id: str, cron: CronORM) -> None:
         """Delete a stateless cron thread when run preparation fails mid-flight."""
         try:
-            await delete_thread_by_id(thread_id, cron.user_id)
+            await delete_thread_by_id(thread_id, cron.user_id, tenant_id)
         except Exception:
             logger.exception(
                 "Failed to delete stateless cron thread after run setup error",
