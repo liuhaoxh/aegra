@@ -41,6 +41,7 @@ from aegra_api.observability.setup import setup_observability
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
+from aegra_api.services.graph_lifecycle import run_graph_shutdown_hooks
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
 from aegra_api.services.run_preparation import get_default_durability
@@ -129,6 +130,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # Initialize LangGraph service
         langgraph_service = get_langgraph_service()
         await langgraph_service.initialize()
+
+        # Graph-owned resources close in THIS loop. AsyncExitStack unwinds LIFO,
+        # so registering here (after db_manager.close, before the executor) makes
+        # the real shutdown order: executor drains → graph hooks → DB close.
+        stack.push_async_callback(run_graph_shutdown_hooks)
 
         # Initialize Redis broker (if enabled)
         if settings.redis.REDIS_BROKER_ENABLED:

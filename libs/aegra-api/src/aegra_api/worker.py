@@ -36,6 +36,7 @@ from aegra_api.observability.setup import setup_observability
 from aegra_api.services.broker import broker_manager
 from aegra_api.services.cron_scheduler import cron_scheduler
 from aegra_api.services.executor import executor
+from aegra_api.services.graph_lifecycle import run_graph_shutdown_hooks
 from aegra_api.services.langgraph_service import get_langgraph_service
 from aegra_api.services.lease_reaper import lease_reaper
 from aegra_api.settings import settings
@@ -64,6 +65,10 @@ async def worker_lifespan() -> AsyncGenerator[None]:
 
         langgraph_service = get_langgraph_service()
         await langgraph_service.initialize()
+
+        # Same contract as the API lifespan (LIFO): executor drain → graph hooks
+        # → DB close.
+        stack.push_async_callback(run_graph_shutdown_hooks)
 
         try:
             await redis_manager.initialize()
