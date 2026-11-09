@@ -170,7 +170,7 @@ def test_trusted_identity_rejects_unauthenticated() -> None:
 
 def test_trusted_identity_rejects_non_string_claim() -> None:
     with pytest.raises(HTTPException) as exc:
-        trusted_identity(_user("u1", None, tenant_id=123))
+        trusted_identity(_user("u1", 123))  # non-string tenant claim
     assert exc.value.status_code in (403, 500)
 
 
@@ -540,6 +540,106 @@ async def test_unknown_claim_refusal_reaches_the_caller_as_422(
             initial_status="pending",
         )
     assert exc.value.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Principal projection: non-None claims + deployment-approved claims
+# ---------------------------------------------------------------------------
+
+
+def test_projection_carries_only_non_none_claims() -> None:
+    """Declared-but-unset User fields are not claims.
+
+    Regression: ``model_dump()`` emitted the ``email``/``org_id`` defaults as
+    ``None``, the closed whitelist refused them, and every real run was 422
+    before admission.
+    """
+    principal = project_principal(User(identity="owner-1"))
+    dumped = principal.model_dump(exclude_none=True)
+
+    assert dumped["identity"] == "owner-1"
+    assert "email" not in dumped
+    assert "org_id" not in dumped
+
+
+def test_deployment_allowed_claim_is_carried_into_the_run() -> None:
+    """A claim the deployment names as allowed survives the projection."""
+    principal = project_principal(
+        User(identity="owner-1", conversation_id="conv-1"),
+        allowed_claims=("conversation_id",),
+    )
+
+    assert principal.model_dump()["conversation_id"] == "conv-1"
+
+
+def test_allowed_claims_cannot_smuggle_credentials() -> None:
+    """Listing a credential-shaped name as allowed does not carry it."""
+    principal = project_principal(
+        User(identity="owner-1", access_token="tok-1"),
+        allowed_claims=("access_token",),
+    )
+
+    assert "access_token" not in principal.model_dump(exclude_none=True)
+
+
+def test_unlisted_extra_claim_is_refused_with_allowed_claims_configured() -> None:
+    """The allowlist is additive; anything unlisted stays fail-closed."""
+    with pytest.raises(UnapprovedPrincipalClaim) as exc:
+        project_principal(
+            User(identity="owner-1", conversation_id="conv-1", subscription_tier="pro"),
+            allowed_claims=("conversation_id",),
+        )
+
+    assert "subscription_tier" in str(exc.value)
+
+
+async def test_configured_claim_reaches_admission_and_the_run_row(
+    _session: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AEGRA_ALLOWED_PRINCIPAL_CLAIMS unblocks the auth backend's real claim."""
+    _patch_common(monkeypatch)
+    monkeypatch.setenv("AEGRA_ALLOWED_PRINCIPAL_CLAIMS", "conversation_id")
+    monkeypatch.setattr(mod, "_find_admitted_run", AsyncMock(return_value=None))
+    _session.scalar = AsyncMock(return_value=_assistant())
+    submit = AsyncMock()
+
+    with (
+        patch(f"{MODULE}.get_langgraph_service") as lg,
+        patch(f"{MODULE}.executor") as exec_mod,
+    ):
+        lg.return_value.list_graphs.return_value = ["agent"]
+        exec_mod.submit = submit
+        _run_id, _run, job = await _prepare_run(
+            _session,
+            "thread-1",
+            _request(),
+            _user(conversation_id="conv-1"),
+            initial_status="pending",
+        )
+
+    assert job is not None
+    assert job.user.model_dump()["conversation_id"] == "conv-1"
+    assert "conv-1" in json.dumps(job.to_execution_params())
+
+
+async def test_unconfigured_claim_still_422s_at_admission(
+    _session: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the deployment allowlist the same claim is refused."""
+    _patch_common(monkeypatch)
+    monkeypatch.delenv("AEGRA_ALLOWED_PRINCIPAL_CLAIMS", raising=False)
+
+    with pytest.raises(HTTPException) as exc:
+        await _prepare_run(
+            _session,
+            "thread-1",
+            _request(),
+            _user(conversation_id="conv-1"),
+            initial_status="pending",
+        )
+
+    assert exc.value.status_code == 422
+    assert "conversation_id" in str(exc.value.detail)
 
 
 async def test_worker_queue_payload_is_only_the_run_id() -> None:
