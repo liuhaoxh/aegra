@@ -71,6 +71,7 @@ class TestRunsStreamingEndpoints:
 
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
                 "aegra_api.services.run_preparation.resolve_assistant_id",
@@ -156,6 +157,7 @@ class TestRunsStreamingEndpoints:
 
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),
@@ -210,6 +212,7 @@ class TestRunsStreamingEndpoints:
 
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.update_thread_metadata", new_callable=AsyncMock),

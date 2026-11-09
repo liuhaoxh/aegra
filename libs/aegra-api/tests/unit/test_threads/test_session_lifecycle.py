@@ -178,7 +178,12 @@ class TestThreadGraphIdLookup:
             graph_id = await _get_thread_graph_id("thread-123", User(identity="user-1", scopes=[]))
 
         assert graph_id == "graph-123"
-        assert session.statements[0].compile().params == {"thread_id_1": "thread-123", "user_id_1": "user-1"}
+        # Identity scope is (tenant, owner): an unclaimed tenant is the install default.
+        assert session.statements[0].compile().params == {
+            "thread_id_1": "thread-123",
+            "user_id_1": "user-1",
+            "tenant_id_1": "default",
+        }
 
     @pytest.mark.asyncio
     async def test_returns_404_for_unowned_thread_without_touching_langgraph(self) -> None:

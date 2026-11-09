@@ -1386,3 +1386,42 @@ class TestAuthDispatch:
         stmt = assistant_service.session.scalars.call_args.args[0]
         compiled = stmt.compile(dialect=postgresql.dialect())
         assert {"owner": "user-123"} in compiled.params.values()
+
+
+@pytest.mark.asyncio
+async def test_create_assistant_validates_graph_with_caller_identity(
+    mock_session: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Graph validation must carry the authenticated caller into the factory.
+
+    FollowMe fail-closed adapter factories refuse to build without a verified
+    user (langgraph_service passes ``user`` straight into the factory via
+    ``ServerRuntime``). Passing ``None`` here (the pre-fix behavior) made every
+    assistant creation for such graphs fail — and it must not be "fixed" by
+    widening the anonymous fallback.
+    """
+    from unittest.mock import MagicMock
+
+    user = User(identity="caller-1", display_name="Caller", tenant_id="acme")
+    lg = MagicMock()
+    lg.list_graphs.return_value = ["followme-graph"]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_validation(graph_id, *, config=None, access_context="assistants.read", user=None):
+        captured["graph_id"] = graph_id
+        captured["user"] = user
+        return MagicMock()  # any compiled graph
+
+    lg.get_graph_for_validation = fake_validation
+
+    # DB interactions: insertion succeeds and echoes the row back
+    mock_session.scalars.side_effect = lambda stmt: DummyScalarResult([echo_inserted_row(stmt)])
+
+    service = AssistantService(mock_session, user, lg)
+    request = AssistantCreate(graph_id="followme-graph", name="A1")
+
+    await service.create_assistant(request)
+
+    assert captured["graph_id"] == "followme-graph"
+    assert captured["user"] is user, "caller identity must reach the graph factory"

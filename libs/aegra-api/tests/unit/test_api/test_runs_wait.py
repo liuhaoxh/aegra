@@ -62,6 +62,7 @@ def _make_request() -> MagicMock:
     request.multitask_strategy = None
     request.stream_subgraphs = False
     request.metadata = None
+    request.operation_key = None  # real RunCreate default: no client-stable key
     return request
 
 
@@ -111,6 +112,7 @@ async def _consume_streaming_response(response: object) -> dict:
 # Standard patches for _prepare_run dependencies
 _PREPARE_RUN_PATCHES = {
     "aegra_api.services.run_preparation._validate_resume_command": AsyncMock,
+    "aegra_api.services.run_preparation.authorize_thread_scope": AsyncMock,
     "aegra_api.services.run_preparation.set_thread_status": AsyncMock,
     "aegra_api.services.run_preparation.update_thread_metadata": AsyncMock,
     "aegra_api.services.run_preparation.resolve_assistant_id": None,
@@ -146,6 +148,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
@@ -187,6 +190,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
@@ -234,6 +238,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
@@ -281,6 +286,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
@@ -320,6 +326,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),
@@ -355,6 +362,7 @@ class TestWaitForRunExceptionPaths:
             patch("aegra_api.api.runs._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_waiters._get_session_maker", return_value=mock_maker),
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="test-assistant"),
             patch("aegra_api.services.run_preparation.set_thread_status", new_callable=AsyncMock),

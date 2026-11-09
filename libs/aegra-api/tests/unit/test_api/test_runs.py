@@ -42,6 +42,7 @@ class TestRunsEndpoints:
         return ThreadORM(
             thread_id="test-thread-123",
             user_id="test-user",
+            tenant_id="default",
             status="idle",
             metadata_json={},
             created_at=datetime.now(UTC),
@@ -76,6 +77,7 @@ class TestRunsEndpoints:
         # Mock dependencies
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
                 "aegra_api.services.run_preparation.resolve_assistant_id",
@@ -121,6 +123,7 @@ class TestRunsEndpoints:
 
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch("aegra_api.services.run_preparation.resolve_assistant_id", return_value="nonexistent"),
         ):
@@ -145,6 +148,7 @@ class TestRunsEndpoints:
 
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
                 "aegra_api.services.run_preparation.resolve_assistant_id",
@@ -177,6 +181,7 @@ class TestRunsEndpoints:
 
         with (
             patch("aegra_api.services.run_preparation._validate_resume_command", new_callable=AsyncMock),
+            patch("aegra_api.services.run_preparation.authorize_thread_scope", new_callable=AsyncMock),
             patch("aegra_api.services.run_preparation.get_langgraph_service") as mock_lg_service,
             patch(
                 "aegra_api.services.run_preparation.resolve_assistant_id",

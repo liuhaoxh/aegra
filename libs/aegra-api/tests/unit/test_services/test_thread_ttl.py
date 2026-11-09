@@ -501,7 +501,7 @@ class TestPruneForUser:
             new_callable=AsyncMock,
             side_effect=batches,
         ) as mock_batch:
-            deleted, pruned = await prune_expired_threads_for_user(session, user_id="user-1")
+            deleted, pruned = await prune_expired_threads_for_user(session, user_id="user-1", tenant_id="default")
 
         assert (deleted, pruned) == (2, 1)
         assert mock_batch.await_count == 3
@@ -527,7 +527,9 @@ class TestPruneById:
         with patch(
             "aegra_api.services.thread_ttl.db_manager", MagicMock(get_checkpointer=MagicMock(return_value=AsyncMock()))
         ):
-            await prune_threads_by_id(session, thread_ids=["t-1"], strategy="delete", user_id="u-1")
+            await prune_threads_by_id(
+                session, thread_ids=["t-1"], strategy="delete", user_id="u-1", tenant_id="default"
+            )
 
         sql = str(session.scalars.await_args.args[0].compile(dialect=postgresql.dialect()))
         assert "thread.user_id = " in sql
@@ -543,7 +545,11 @@ class TestPruneById:
             "aegra_api.services.thread_ttl.db_manager", MagicMock(get_checkpointer=MagicMock(return_value=checkpointer))
         ):
             count = await prune_threads_by_id(
-                session, thread_ids=["t-1", "t-2", "t-x"], strategy="delete", user_id="u-1"
+                session,
+                thread_ids=["t-1", "t-2", "t-x"],
+                strategy="delete",
+                user_id="u-1",
+                tenant_id="default",
             )
 
         assert count == 2
@@ -562,7 +568,11 @@ class TestPruneById:
             "aegra_api.services.thread_ttl.db_manager", MagicMock(get_checkpointer=MagicMock(return_value=checkpointer))
         ):
             count = await prune_threads_by_id(
-                session, thread_ids=["t-plain", "t-delta"], strategy="keep_latest", user_id="u-1"
+                session,
+                thread_ids=["t-plain", "t-delta"],
+                strategy="keep_latest",
+                user_id="u-1",
+                tenant_id="default",
             )
 
         assert count == 1
