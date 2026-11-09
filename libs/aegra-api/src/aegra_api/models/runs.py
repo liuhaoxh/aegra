@@ -42,6 +42,22 @@ class RunCreate(BaseModel):
     )
     config: dict[str, Any] | None = Field(default_factory=dict, description="Execution config")
     context: dict[str, Any] | None = Field(default_factory=dict, description="Execution context")
+    operation_key: str | None = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9_.:/\-]+$",
+        description=(
+            "Client-stable key for one logical run. Repeating the same key with the same "
+            "intent returns the existing run; a different intent is a 409. The intent "
+            "covers everything that changes execution, persistence or events: assistant, "
+            "input, command, checkpoint (with checkpoint_id folded in), config, context, "
+            "durability (with the deprecated checkpoint_during alias resolved), "
+            "multitask_strategy, interrupt_before/after, stream, stream_mode, "
+            "stream_subgraphs, on_disconnect, on_completion and metadata. "
+            "Omitted keys are not deduplicated."
+        ),
+    )
     checkpoint: dict[str, Any] | None = Field(
         None,
         description="Checkpoint configuration (e.g., {'checkpoint_id': '...', 'checkpoint_ns': ''})",
@@ -192,6 +208,12 @@ class Run(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    @field_validator("tenant_id", mode="before")
+    @classmethod
+    def _default_tenant(cls, v: object) -> object:
+        # Pre-admission rows (created before 20261109 migration) have no tenant.
+        return v if isinstance(v, str) and v else "default"
+
     run_id: str = Field(..., description="Unique identifier for the run.")
     thread_id: str = Field(..., description="Thread this run belongs to.")
     assistant_id: str = Field(..., description="Assistant that is executing this run.")
@@ -212,6 +234,13 @@ class Run(BaseModel):
         default_factory=dict, description="Context variables available during execution."
     )
     user_id: str = Field(..., description="Identifier of the user who owns this run.")
+    tenant_id: str = Field(
+        "default",
+        description="Trusted tenant that admitted this run. Pre-admission rows report the install default.",
+    )
+    operation_key: str | None = Field(
+        None, description="Client-stable key that made this run idempotent, when provided."
+    )
     created_at: datetime = Field(..., description="Timestamp when the run was created.")
     updated_at: datetime = Field(..., description="Timestamp when the run was last updated.")
 

@@ -102,6 +102,10 @@ class Assistant(Base):
     config: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"))
     context: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Trusted tenant of the owning principal. NULL = written before tenant
+    # attribution; such rows are visible only through the explicit
+    # single-tenant branch (tenant_scope) and never by an owner-only match.
+    tenant_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     metadata_dict: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"), name="metadata")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
@@ -110,13 +114,42 @@ class Assistant(Base):
     # Indexes for performance
     __table_args__ = (
         Index("idx_assistant_user", "user_id"),
-        Index("idx_assistant_user_assistant", "user_id", "assistant_id", unique=True),
+        Index("idx_assistant_tenant_user", "tenant_id", "user_id"),
+        # Uniqueness is per (tenant, owner): the same owner in another tenant is
+        # a different party. Split into two partial indexes because Postgres
+        # treats NULLs as distinct, so a single index including tenant_id would
+        # silently drop the uniqueness guarantee for pre-attribution rows.
         Index(
-            "idx_assistant_user_graph_config",
+            "idx_assistant_tenant_user_assistant",
+            "tenant_id",
+            "user_id",
+            "assistant_id",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
+        ),
+        Index(
+            "idx_assistant_user_assistant_legacy",
+            "user_id",
+            "assistant_id",
+            unique=True,
+            postgresql_where=text("tenant_id IS NULL"),
+        ),
+        Index(
+            "idx_assistant_tenant_user_graph_config",
+            "tenant_id",
             "user_id",
             "graph_id",
             text("md5(config::text)"),
             unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
+        ),
+        Index(
+            "idx_assistant_user_graph_config_legacy",
+            "user_id",
+            "graph_id",
+            text("md5(config::text)"),
+            unique=True,
+            postgresql_where=text("tenant_id IS NULL"),
         ),
     )
 
@@ -145,11 +178,15 @@ class Thread(Base):
     # Database column is 'metadata_json' (per database.py). ORM attribute 'metadata_json' must map to that column.
     metadata_json: Mapped[dict] = mapped_column("metadata_json", JsonbSafe, server_default=text("'{}'::jsonb"))
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Trusted tenant from the authenticated context (never client input).
+    # NULL means "written before tenant attribution existed" — never a default
+    # and never treated as a tenant on its own; see tenant_scope().
+    tenant_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
     # Indexes for performance
-    __table_args__ = (Index("idx_thread_user", "user_id"),)
+    __table_args__ = (Index("idx_thread_user", "user_id"), Index("idx_thread_tenant_user", "tenant_id", "user_id"))
 
 
 class Run(Base):
@@ -168,6 +205,16 @@ class Run(Base):
     output: Mapped[dict | None] = mapped_column(JsonbSafe)
     error_message: Mapped[str | None] = mapped_column(Text)
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Run admission: trusted tenant, client-stable operation key and the frozen
+    # digest of the request intent. The partial unique index on
+    # (tenant_id, user_id, thread_id, operation_key) makes one key one run.
+    tenant_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operation_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    intent_digest: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Admission schema version persisted in execution_params; the run-row copy
+    # exists so the worker can distinguish legacy rows from rows this code
+    # wrote without parsing the payload blob (NULL => pre-migration row).
+    admission_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=text("now()"))
 
@@ -189,6 +236,16 @@ class Run(Base):
         Index("idx_runs_assistant_id", "assistant_id"),
         Index("idx_runs_created_at", "created_at"),
         Index("idx_runs_lease_reaper", "status", "lease_expires_at"),
+        Index("idx_runs_tenant_user", "tenant_id", "user_id"),
+        Index(
+            "uq_runs_tenant_owner_thread_opkey",
+            "tenant_id",
+            "user_id",
+            "thread_id",
+            "operation_key",
+            unique=True,
+            postgresql_where=text("operation_key IS NOT NULL"),
+        ),
     )
 
 
@@ -204,6 +261,12 @@ class Cron(Base):
         Text, ForeignKey("thread.thread_id", ondelete="CASCADE"), nullable=True
     )
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    # Trusted tenant of the creating principal. Nullable on purpose: rows
+    # written before this column have NO provable attribution, and a blanket
+    # backfill to 'default' would be an unverified cross-tenant claim. Reads are
+    # tenant-scoped, so unattributed legacy rows are unreachable (fail-closed)
+    # until an operator attributes them explicitly.
+    tenant_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     schedule: Mapped[str] = mapped_column(Text, nullable=False)
     # JsonbSafe strips NULL bytes from user payloads — same protection as runs.input.
     payload: Mapped[dict] = mapped_column(JsonbSafe, server_default=text("'{}'::jsonb"))
@@ -218,6 +281,7 @@ class Cron(Base):
 
     __table_args__ = (
         Index("idx_cron_user", "user_id"),
+        Index("idx_cron_tenant_user", "tenant_id", "user_id"),
         Index("idx_cron_assistant_id", "assistant_id"),
         Index("idx_cron_thread_id", "thread_id"),
         Index("idx_cron_next_run", "enabled", "next_run_date"),
