@@ -95,8 +95,7 @@ async def engine() -> AsyncIterator[AsyncEngine]:
 async def maker(engine: AsyncEngine) -> async_sessionmaker:
     return async_sessionmaker(engine, expire_on_commit=False)
 
-
-async def _seed_thread(maker: async_sessionmaker, *, thread_id: str, owner: str, tenant: str) -> None:
+async def _seed_thread(maker: async_sessionmaker, *, thread_id: str, owner: str, tenant: str | None) -> None:
     """Create one thread under an explicit scope, replacing any stale row.
 
     The suite runs against a persistent database: a row left behind by an
@@ -583,7 +582,14 @@ def _payload(job_from_row: dict) -> dict:
     return job_from_row
 
 
-async def _verify(maker, run_kwargs, params_mutator=None, principal_tenant=_ROW_TENANT, principal_identity=None):
+async def _verify(
+    maker,
+    run_kwargs,
+    params_mutator=None,
+    principal_tenant=_ROW_TENANT,
+    principal_identity=None,
+    thread_tenant=_ROW_TENANT,
+):
     """Build one real row + payload, then run the worker verifier on it."""
     from aegra_api.models.run_job import RunJob
     from aegra_api.services.worker_executor import _verify_run_principal
@@ -596,7 +602,7 @@ async def _verify(maker, run_kwargs, params_mutator=None, principal_tenant=_ROW_
         maker,
         thread_id=run_kwargs["thread_id"],
         owner=run_kwargs["user_id"],
-        tenant=run_kwargs["tenant_id"],
+        tenant=run_kwargs["tenant_id"] if thread_tenant is _ROW_TENANT else thread_tenant,
     )
 
     async with maker() as session:
@@ -716,6 +722,78 @@ async def test_legacy_row_without_admission_version_stays_relaxed(maker) -> None
             await s.execute(text("delete from runs where run_id = 'adm-v-run'"))
             await s.execute(text("delete from thread where thread_id = 'adm-v-thread'"))
             await s.commit()
+
+
+async def test_admitted_run_is_refused_for_null_tenant_thread(maker) -> None:
+    """A tenant-v admitted run must never execute against an unattributed thread.
+
+    ``tenant_scope`` makes NULL-tenant thread rows visible only under an
+    explicitly matching single-tenant config, so accepting them here would let a
+    pre-attribution thread be driven by a tenant-scoped run while every other
+    read path refuses it.
+    """
+    await _drop_thread(maker, "adm-v-thread")
+    try:
+        reason = await _verify(maker, _admitted_row_kwargs(), thread_tenant=None)
+        assert reason is not None and "thread tenant" in reason, reason
+    finally:
+        await _drop_thread(maker, "adm-v-thread")
+
+
+async def test_legacy_null_row_needs_explicit_single_tenant_for_null_thread(
+    maker, monkeypatch
+) -> None:
+    """Legacy compatibility survives, but only for an unattributed run row."""
+    kw = _admitted_row_kwargs(tenant_id=None, operation_key=None, intent_digest=None, admission_version=None)
+    await _drop_thread(maker, "adm-v-thread")
+    try:
+        monkeypatch.setenv("AEGRA_SINGLE_TENANT_ID", "tenant-a")
+        reason = await _verify(maker, kw, principal_tenant=None, thread_tenant=None)
+        assert reason is None, reason
+
+        # A NULL-tenant thread attributed to another tenant is still refused.
+        await _drop_thread(maker, "adm-v-thread")
+        reason = await _verify(maker, kw, principal_tenant=None, thread_tenant="tenant-b")
+        assert reason is not None and "thread tenant" in reason, reason
+
+        # No explicit single-tenant decision: nothing is accepted by default.
+        await _drop_thread(maker, "adm-v-thread")
+        monkeypatch.delenv("AEGRA_SINGLE_TENANT_ID", raising=False)
+        reason = await _verify(maker, kw, principal_tenant=None, thread_tenant=None)
+        assert reason is not None and "no tenant attribution" in reason, reason
+    finally:
+        await _drop_thread(maker, "adm-v-thread")
+
+
+async def test_thread_scope_reason_matrix(monkeypatch) -> None:
+    """The thread-row rule in isolation: owner exact, tenant never widened by NULL.
+
+    Kept pure (no DB) so every branch of the compatibility rule is pinned: a NULL
+    thread tenant needs BOTH an unattributed run row and an explicitly configured
+    single tenant that matches it.
+    """
+    from types import SimpleNamespace
+
+    from aegra_api.services.worker_executor import (
+        _thread_owner_reason,
+        _thread_scope_reason,
+        _thread_tenant_reason,
+    )
+
+    admitted = SimpleNamespace(user_id="owner", tenant_id="tenant-v")
+    assert _thread_scope_reason(admitted, ("owner", "tenant-v")) is None
+    assert "thread tenant" in (_thread_scope_reason(admitted, ("owner", None)) or "")
+    assert "thread tenant" in (_thread_scope_reason(admitted, ("owner", "other")) or "")
+    assert "thread owner" in (_thread_owner_reason(admitted, ("intruder", "tenant-v")) or "")
+    assert _thread_owner_reason(admitted, ("owner", None)) is None
+
+    legacy = SimpleNamespace(user_id="owner", tenant_id=None)
+    monkeypatch.delenv("AEGRA_SINGLE_TENANT_ID", raising=False)
+    assert "no tenant attribution" in (_thread_tenant_reason(legacy, ("owner", None)) or "")
+    monkeypatch.setenv("AEGRA_SINGLE_TENANT_ID", "tenant-a")
+    assert _thread_tenant_reason(legacy, ("owner", None)) is None
+    assert _thread_tenant_reason(legacy, ("owner", "tenant-a")) is None
+    assert "configured tenant" in (_thread_tenant_reason(legacy, ("owner", "tenant-b")) or "")
 
 
 async def test_keyless_api_contract_unchanged(maker) -> None:

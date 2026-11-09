@@ -431,6 +431,71 @@ class _LoadedRun:
         self.trace = trace
 
 
+def _payload_principal_reason(run_orm: RunORM, job: RunJob, *, allow_missing_tenant: bool) -> str | None:
+    """Compare the persisted principal against the authoritative run row."""
+    payload_user = job.user.model_dump()
+    claim = payload_user.get("tenant_id")
+    if allow_missing_tenant:
+        if claim not in (None, run_orm.tenant_id):
+            return f"legacy payload principal tenant {claim!r} != row tenant {run_orm.tenant_id!r}"
+    elif claim != run_orm.tenant_id:
+        return f"payload principal tenant {claim!r} != row tenant {run_orm.tenant_id!r}"
+    if payload_user.get("identity") != run_orm.user_id:
+        return f"payload principal {payload_user.get('identity')!r} != row owner {run_orm.user_id!r}"
+    return None
+
+
+def _admitted_payload_reason(run_orm: RunORM, job: RunJob) -> str | None:
+    """Admitted row: every admission marker and scope source must agree exactly."""
+    if job.admission_version != run_orm.admission_version:
+        return f"payload admission version {job.admission_version!r} != row {run_orm.admission_version!r}"
+    if job.operation_key != run_orm.operation_key:
+        return f"payload operation key {job.operation_key!r} != row {run_orm.operation_key!r}"
+    if job.tenant_id != run_orm.tenant_id:
+        return f"payload tenant {job.tenant_id!r} != row tenant {run_orm.tenant_id!r}"
+    return _payload_principal_reason(run_orm, job, allow_missing_tenant=False)
+
+
+def _legacy_payload_reason(run_orm: RunORM, job: RunJob) -> str | None:
+    """Pre-migration row: the payload may omit scope but must not contradict it."""
+    if job.admission_version is not None or job.operation_key is not None:
+        return "legacy run row carries admission markers in its payload"
+    if job.tenant_id is not None and job.tenant_id != run_orm.tenant_id:
+        return f"legacy payload tenant {job.tenant_id!r} != row tenant {run_orm.tenant_id!r}"
+    return _payload_principal_reason(run_orm, job, allow_missing_tenant=True)
+
+
+def _thread_owner_reason(run_orm: RunORM, thread_scope) -> str | None:
+    """Owner equality is exact: a NULL or renamed owner is never acceptable."""
+    if thread_scope[0] != run_orm.user_id:
+        return f"thread owner {thread_scope[0]!r} != run owner {run_orm.user_id!r}"
+    return None
+
+
+def _thread_tenant_reason(run_orm: RunORM, thread_scope) -> str | None:
+    """Tenant compatibility, including the explicit single-tenant legacy mode.
+
+    A NULL thread tenant is a pre-attribution row, and ``tenant_scope`` makes
+    those visible only when the deployment declares one tenant explicitly. A run
+    row that does carry a tenant therefore never binds to a NULL thread tenant.
+    """
+    thread_tenant = thread_scope[1]
+    if run_orm.tenant_id is not None:
+        if thread_tenant != run_orm.tenant_id:
+            return f"thread tenant {thread_tenant!r} != run tenant {run_orm.tenant_id!r}"
+        return None
+    single = os.environ.get("AEGRA_SINGLE_TENANT_ID", "").strip()
+    if not single:
+        return "run row has no tenant attribution (legacy row in a multi-tenant deployment)"
+    if thread_tenant not in (single, None):
+        return f"thread tenant {thread_tenant!r} != configured tenant {single!r}"
+    return None
+
+
+def _thread_scope_reason(run_orm: RunORM, thread_scope) -> str | None:
+    """The thread row must be the run's own party: owner exact, tenant compatible."""
+    return _thread_owner_reason(run_orm, thread_scope) or _thread_tenant_reason(run_orm, thread_scope)
+
 async def _verify_run_principal(
     session: AsyncSession, run_orm: RunORM, job: RunJob
 ) -> str | None:
@@ -453,38 +518,20 @@ async def _verify_run_principal(
     and the payload must merely not contradict it. Everything missing or
     mismatched on an admitted row is refused.
 
+    The thread row must belong to the same party. A NULL thread tenant is a
+    pre-attribution row: it is only compatible with an unattributed run row
+    under an explicitly configured single tenant, so an admitted run row never
+    executes against it.
+
     Returns a short reason string on failure, ``None`` when the run may execute.
     """
-    is_admitted_row = run_orm.admission_version is not None
-
-    if not is_admitted_row:
-        if job.admission_version is not None or job.operation_key is not None:
-            return "legacy run row carries admission markers in its payload"
-        if job.tenant_id is not None and job.tenant_id != run_orm.tenant_id:
-            return f"legacy payload tenant {job.tenant_id!r} != row tenant {run_orm.tenant_id!r}"
-        payload_user = job.user.model_dump()
-        if payload_user.get("tenant_id") not in (None, run_orm.tenant_id):
-            return (
-                f"legacy payload principal tenant {payload_user.get('tenant_id')!r} "
-                f"!= row tenant {run_orm.tenant_id!r}"
-            )
-        if payload_user.get("identity") != run_orm.user_id:
-            return f"payload principal {payload_user.get('identity')!r} != row owner {run_orm.user_id!r}"
-    else:
-        if job.admission_version != run_orm.admission_version:
-            return f"payload admission version {job.admission_version!r} != row {run_orm.admission_version!r}"
-        if job.operation_key != run_orm.operation_key:
-            return f"payload operation key {job.operation_key!r} != row {run_orm.operation_key!r}"
-        if job.tenant_id != run_orm.tenant_id:
-            return f"payload tenant {job.tenant_id!r} != row tenant {run_orm.tenant_id!r}"
-        payload_user = job.user.model_dump()
-        if payload_user.get("tenant_id") != run_orm.tenant_id:
-            return (
-                f"payload principal tenant {payload_user.get('tenant_id')!r} "
-                f"!= row tenant {run_orm.tenant_id!r}"
-            )
-        if payload_user.get("identity") != run_orm.user_id:
-            return f"payload principal {payload_user.get('identity')!r} != row owner {run_orm.user_id!r}"
+    reason = (
+        _admitted_payload_reason(run_orm, job)
+        if run_orm.admission_version is not None
+        else _legacy_payload_reason(run_orm, job)
+    )
+    if reason is not None:
+        return reason
 
     thread_scope = (
         await session.execute(
@@ -493,20 +540,7 @@ async def _verify_run_principal(
     ).one_or_none()
     if thread_scope is None:
         return f"thread {run_orm.thread_id!r} not found"
-    # NULL tenant = pre-attribution row: only acceptable when the deployment is
-    # explicitly single-tenant, and then it must match that one tenant.
-    row_tenant = run_orm.tenant_id
-    if row_tenant is None:
-        single = os.environ.get("AEGRA_SINGLE_TENANT_ID", "").strip()
-        if not single:
-            return "run row has no tenant attribution (legacy row in a multi-tenant deployment)"
-        row_tenant = single
-    if thread_scope[0] != run_orm.user_id or thread_scope[1] not in (row_tenant, None):
-        return (
-            f"thread scope {(thread_scope[0], thread_scope[1])!r} "
-            f"!= run scope {(run_orm.user_id, run_orm.tenant_id)!r}"
-        )
-    return None
+    return _thread_scope_reason(run_orm, thread_scope)
 
 
 async def _acquire_and_load(run_id: str, worker_name: str) -> _LoadedRun | None:
