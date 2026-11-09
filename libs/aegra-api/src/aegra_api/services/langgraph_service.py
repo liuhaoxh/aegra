@@ -123,32 +123,41 @@ def _parse_graph_config_entry(graph_id: str, graph_config: object) -> GraphRegis
     return registry_entry
 
 
+def _business_graphs() -> frozenset[str]:
+    """Graph ids that MUST NOT run without persistence (FollowMe business
+    graphs). Trusted server config: ``AEGRA_BUSINESS_GRAPHS`` (comma- or
+    space-separated). Empty set ⇒ no graph is classified business (pure
+    legacy deployments keep the compat behavior)."""
+    raw = settings.app.AEGRA_BUSINESS_GRAPHS or ""
+    return frozenset(part.strip() for part in raw.replace(",", " ").split() if part.strip())
+
+
 def _apply_injection_policy(graph_to_use: Pregel, graph_id: str, exc: Exception) -> Pregel:
     """Resolve a failed checkpointer/store injection per deployment policy.
 
-    When the server requires persistence (AEGRA_PERSISTENCE_REQUIRED),
-    refuse to execute rather than silently dropping checkpoint state;
-    otherwise keep the legacy fallback (unpersisted run) for graphs that
-    do not support injection.
+    FollowMe business graphs (``AEGRA_BUSINESS_GRAPHS``) and any graph when
+    the deployment mandates persistence (``AEGRA_PERSISTENCE_REQUIRED``)
+    FAIL CLOSED: refuse to execute rather than silently dropping checkpoint
+    state. Other graphs keep the legacy fallback (warn + unpersisted run).
     """
-    if not settings.checkpointer.AEGRA_PERSISTENCE_REQUIRED:
-        logger.warning(
+    if settings.checkpointer.AEGRA_PERSISTENCE_REQUIRED or graph_id in _business_graphs():
+        logger.error(
             "graph_checkpointer_injection_failed",
             graph_id=graph_id,
             exc=str(exc),
-            msg="Graph does not support checkpointer injection; running without persistence",
+            msg="Refusing to execute graph without persistence",
         )
-        return graph_to_use
-    logger.error(
+        raise RuntimeError(
+            f"Graph {graph_id!r} does not support checkpointer/store injection; "
+            "refusing to run without persistence"
+        ) from exc
+    logger.warning(
         "graph_checkpointer_injection_failed",
         graph_id=graph_id,
         exc=str(exc),
-        msg="Refusing to execute graph without persistence",
+        msg="Graph does not support checkpointer injection; running without persistence",
     )
-    raise RuntimeError(
-        f"Graph {graph_id!r} does not support checkpointer/store injection; "
-        "refusing to run without persistence"
-    ) from exc
+    return graph_to_use
 
 
 def _require_persistence_if_configured(checkpointer: Any, store: Any, graph_id: str) -> None:

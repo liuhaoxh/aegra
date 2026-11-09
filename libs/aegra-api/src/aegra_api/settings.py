@@ -94,6 +94,9 @@ class AppSettings(EnvBase):
     AEGRA_CONFIG: str = "aegra.json"  # Default config file path
     KEEPALIVE_INTERVAL_SECS: float = 5  # Heartbeat interval for join/wait endpoints
     AUTH_TYPE: LowerStr = "noop"
+    # Graph ids that must FAIL CLOSED on checkpointer/store injection failure
+    # (FollowMe business graphs). Comma- or space-separated. Empty ⇒ none.
+    AEGRA_BUSINESS_GRAPHS: str = ""
     ENV_MODE: UpperStr = "LOCAL"
     DEBUG: bool = False
     # Default 1000 matches LangGraph Platform threads.search (Agent Server OpenAPI max).
