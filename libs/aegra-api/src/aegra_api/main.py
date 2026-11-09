@@ -29,6 +29,7 @@ from aegra_api.core.database import db_manager
 from aegra_api.core.health import router as health_router
 from aegra_api.core.migrations import run_migrations_async
 from aegra_api.core.redis_manager import redis_manager
+from aegra_api.core.process_role import api_process_consumes_queue
 from aegra_api.core.route_merger import (
     merge_exception_handlers,
     merge_lifespans,
@@ -81,22 +82,33 @@ def _log_connection_help(error: Exception) -> None:
     )
 
 
+async def _run_startup_migrations() -> None:
+    """Apply pending migrations unless disabled for multi-pod deployments.
+
+    Multi-pod K8s: set RUN_MIGRATIONS_ON_STARTUP=false + run
+    `aegra db upgrade` out-of-band. See docs/guides/deployment.mdx.
+    """
+    if not settings.app.RUN_MIGRATIONS_ON_STARTUP:
+        logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
+        return
+    try:
+        await run_migrations_async()
+    except (ConnectionRefusedError, OSError) as e:
+        _log_connection_help(e)
+        raise
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager for startup/shutdown"""
     # Resolve the durability default up front: an invalid value fails the boot, not every run.
     get_default_durability()
 
-    # Multi-pod K8s: set RUN_MIGRATIONS_ON_STARTUP=false + run `aegra db upgrade`
-    # out-of-band. See docs/guides/deployment.mdx.
-    if settings.app.RUN_MIGRATIONS_ON_STARTUP:
-        try:
-            await run_migrations_async()
-        except (ConnectionRefusedError, OSError) as e:
-            _log_connection_help(e)
-            raise
-    else:
-        logger.info("skipping startup migrations (RUN_MIGRATIONS_ON_STARTUP=false)")
+    # Role conflict must fail before any side effect (migrations, DB pool,
+    # Redis) so a misconfigured pod crashes without touching infrastructure.
+    api_consumes = api_process_consumes_queue()
+
+    await _run_startup_migrations()
 
     # Startup: Initialize database and LangGraph components
     try:
@@ -107,6 +119,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # Each cleanup is registered once its step has started; they run in reverse start order
     # on shutdown (ttl sweeper → cron → reaper → executor drains jobs → broker → Redis → DB).
+    # The executor is only registered when this process is allowed to consume jobs.
     async with AsyncExitStack() as stack:
         stack.push_async_callback(db_manager.close)
 
@@ -142,9 +155,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await broker_manager.start()
         stack.push_async_callback(broker_manager.stop)
 
-        # Start executor (spawns worker coroutines when Redis is enabled)
-        await executor.start()
-        stack.push_async_callback(executor.stop)
+        # In Redis queue mode the API process keeps the legacy behaviour when
+        # WORKER_ROLE is unset/`all` (it consumes too). `WORKER_ROLE=api`
+        # makes it enqueue-only and hands consumption to
+        # `python -m aegra_api.worker`; LocalExecutor (no Redis) still runs
+        # in-process because there is no queue to hand off.
+        if not settings.redis.REDIS_BROKER_ENABLED or api_consumes:
+            await executor.start()
+            stack.push_async_callback(executor.stop)
+        else:
+            logger.info(
+                "Enqueue-only API process: job queue consumers not started",
+                queue_key=settings.worker.WORKER_QUEUE_KEY,
+                worker_entrypoint="python -m aegra_api.worker",
+            )
 
         # Start lease reaper (recovers crashed worker runs, Redis mode only)
         if settings.redis.REDIS_BROKER_ENABLED:

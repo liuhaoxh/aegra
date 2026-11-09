@@ -299,6 +299,10 @@ def lifespan_events(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     monkeypatch.setattr(main_module.settings.app, "RUN_MIGRATIONS_ON_STARTUP", False)
     monkeypatch.setattr(main_module.settings.redis, "REDIS_BROKER_ENABLED", True)
     monkeypatch.setattr(main_module.settings.cron, "CRON_ENABLED", True)
+    # Unset WORKER_ROLE is the legacy default: the API process also consumes
+    # the queue, which these lifecycle-order tests exercise. The API-only and
+    # worker-only role variants live in test_services/test_worker_process.py.
+    monkeypatch.setattr(main_module.settings.worker, "WORKER_ROLE", None)
     return events
 
 

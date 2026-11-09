@@ -351,6 +351,11 @@ class RedisSettings(EnvBase):
     # connection and timeout errors, with exponential backoff 50ms..1s.
     REDIS_RETRY_ATTEMPTS: int = Field(default=3, ge=0)
 
+# Deployment process roles accepted by WORKER_ROLE. Trusted deployment
+# configuration only — never a request/job field.
+VALID_WORKER_ROLES: frozenset[str] = frozenset({"api", "worker", "all"})
+
+
 
 class WorkerSettings(EnvBase):
     """Worker configuration for background graph execution.
@@ -362,6 +367,13 @@ class WorkerSettings(EnvBase):
     """
 
     WORKER_COUNT: int = 3
+    # Which part of the deployment this process runs.
+    #   unset / "all" — legacy single-process mode: the API process consumes
+    #                   the queue too (pre-role default).
+    #   "api"         — the API process is enqueue-only; never consumes the
+    #                   job queue (run `python -m aegra_api.worker`).
+    #   "worker"      — only the standalone worker entrypoint may boot.
+    WORKER_ROLE: LowerStr | None = None
     N_JOBS_PER_WORKER: int = 10
     WORKER_QUEUE_KEY: str = "aegra:jobs"
     # The read timeout must outlast the block: a client that gives up first drops the reply
@@ -397,6 +409,10 @@ class WorkerSettings(EnvBase):
                 f"LEASE_DURATION_SECONDS ({self.LEASE_DURATION_SECONDS}) must be "
                 f"greater than 2 * HEARTBEAT_INTERVAL_SECONDS ({self.HEARTBEAT_INTERVAL_SECONDS}). "
                 f"A worker must survive at least 2 missed heartbeats before its lease expires."
+            )
+        if self.WORKER_ROLE is not None and self.WORKER_ROLE not in VALID_WORKER_ROLES:
+            raise ValueError(
+                f"WORKER_ROLE must be one of {sorted(VALID_WORKER_ROLES)} or unset, got {self.WORKER_ROLE!r}"
             )
         return self
 
@@ -471,6 +487,12 @@ class CheckpointerSettings(EnvBase):
     """
 
     AEGRA_CHECKPOINT_DURABILITY: str | None = None
+    # Deployment-level persistence gate (trusted server config; clients can
+    # neither see nor set it). Default keeps the legacy permissive fallback:
+    # graphs that cannot accept a checkpointer/store run unpersisted. "true"
+    # makes injection failure or missing saver/store refuse execution — the
+    # fail-closed posture product graphs with checkpointing require.
+    AEGRA_PERSISTENCE_REQUIRED: bool = False
 
 
 class EventStreamingSettings(EnvBase):

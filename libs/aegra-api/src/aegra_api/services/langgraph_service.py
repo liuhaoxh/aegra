@@ -46,6 +46,7 @@ from aegra_api.services.graph_factory import (
     invoke_factory,
     is_factory,
 )
+from aegra_api.settings import settings
 from aegra_api.utils.run_utils import strip_pinned_config_keys
 
 State = TypeVar("State")
@@ -120,6 +121,44 @@ def _parse_graph_config_entry(graph_id: str, graph_config: object) -> GraphRegis
     if description is not None:
         registry_entry["description"] = description
     return registry_entry
+
+
+def _apply_injection_policy(graph_to_use: Pregel, graph_id: str, exc: Exception) -> Pregel:
+    """Resolve a failed checkpointer/store injection per deployment policy.
+
+    When the server requires persistence (AEGRA_PERSISTENCE_REQUIRED),
+    refuse to execute rather than silently dropping checkpoint state;
+    otherwise keep the legacy fallback (unpersisted run) for graphs that
+    do not support injection.
+    """
+    if not settings.checkpointer.AEGRA_PERSISTENCE_REQUIRED:
+        logger.warning(
+            "graph_checkpointer_injection_failed",
+            graph_id=graph_id,
+            exc=str(exc),
+            msg="Graph does not support checkpointer injection; running without persistence",
+        )
+        return graph_to_use
+    logger.error(
+        "graph_checkpointer_injection_failed",
+        graph_id=graph_id,
+        exc=str(exc),
+        msg="Refusing to execute graph without persistence",
+    )
+    raise RuntimeError(
+        f"Graph {graph_id!r} does not support checkpointer/store injection; "
+        "refusing to run without persistence"
+    ) from exc
+
+
+def _require_persistence_if_configured(checkpointer: Any, store: Any, graph_id: str) -> None:
+    """Refuse execution when the deployment mandates persistence but the
+    saver/store stack is half-initialized. Trusted server config only."""
+    if settings.checkpointer.AEGRA_PERSISTENCE_REQUIRED and (checkpointer is None or store is None):
+        raise RuntimeError(
+            f"Persistence is required (AEGRA_PERSISTENCE_REQUIRED=true) but "
+            f"checkpointer/store is unavailable for graph {graph_id!r}"
+        )
 
 
 class LangGraphService:
@@ -384,6 +423,23 @@ class LangGraphService:
             self._base_graph_cache[graph_id] = compiled_graph
         return compiled_graph
 
+    async def _resolve_factory(self, graph_id: str) -> Callable | None:
+        """Resolve the factory callable, lazily re-loading after invalidation.
+
+        Normally populated by _load_all_graph_modules() at startup, but may
+        be empty after invalidate_cache(). In that case re-load the module
+        to re-classify the factory without invoking it with user=None.
+        """
+        factory = self._graph_factories.get(graph_id)
+        if not factory and graph_id not in self._base_graph_cache:
+            # Neither factory nor cached static graph — re-load from file
+            # (post-invalidation path).
+            graph_info = self._graph_registry.get(graph_id)
+            if graph_info:
+                await self._load_graph_from_file(graph_id, graph_info)
+            factory = self._graph_factories.get(graph_id)
+        return factory
+
     @asynccontextmanager
     async def get_graph(
         self,
@@ -435,20 +491,9 @@ class LangGraphService:
         checkpointer = db_manager.get_checkpointer()
         store = db_manager.get_store()
 
-        # Resolve the factory callable. Normally populated by
-        # _load_all_graph_modules() at startup, but may be empty after
-        # invalidate_cache(). In that case we re-load the module to
-        # re-classify the factory without invoking it with user=None.
-        factory = self._graph_factories.get(graph_id)
+        _require_persistence_if_configured(checkpointer, store, graph_id)
 
-        if not factory and graph_id not in self._base_graph_cache:
-            # Neither factory nor cached static graph — re-load from file
-            # (post-invalidation path). This re-classifies factories without
-            # calling _call_factory_with_defaults(user=None).
-            graph_info = self._graph_registry.get(graph_id)
-            if graph_info:
-                await self._load_graph_from_file(graph_id, graph_info)
-            factory = self._graph_factories.get(graph_id)
+        factory = await self._resolve_factory(graph_id)
 
         if factory:
             # Factory path — invoke per-request with ServerRuntime
@@ -467,23 +512,18 @@ class LangGraphService:
                 if isinstance(graph_obj, StateGraph):
                     graph_obj = graph_obj.compile()
 
-                # Inject checkpointer/store into the factory-produced graph
+                # Injection failure handling is deployment policy
+                # (_apply_injection_policy). Do this BEFORE yield to avoid
+                # dual-yield when exceptions occur in the context body.
                 try:
                     graph_to_use = graph_obj.copy(update={"checkpointer": checkpointer, "store": store})
                 except Exception as exc:
-                    logger.warning(
-                        "graph_checkpointer_injection_failed",
-                        graph_id=graph_id,
-                        exc=str(exc),
-                        msg="Graph does not support checkpointer injection; running without persistence",
-                    )
-                    graph_to_use = graph_obj
+                    graph_to_use = _apply_injection_policy(graph_obj, graph_id, exc)
 
                 yield graph_to_use
         else:
             # Static path — use cached base graph (already loaded above)
             base_graph = await self._get_base_graph(graph_id)
-
             # Try to create a copy with checkpointer/store injected.
             # NOTE: Do this BEFORE yield to avoid dual-yield when exceptions
             # occur in the context body.
@@ -492,6 +532,7 @@ class LangGraphService:
             # Pregel.copy() is shallow, so without this, all copies share
             # the same metadata dict, and writes during execution pollute
             # the base graph — breaking subsequent runs.
+
             try:
                 graph_to_use = base_graph.copy(
                     update={
@@ -501,13 +542,7 @@ class LangGraphService:
                     }
                 )
             except Exception as exc:
-                logger.warning(
-                    "graph_checkpointer_injection_failed",
-                    graph_id=graph_id,
-                    exc=str(exc),
-                    msg="Graph does not support checkpointer injection; running without persistence",
-                )
-                graph_to_use = base_graph
+                graph_to_use = _apply_injection_policy(base_graph, graph_id, exc)
 
             yield graph_to_use
 
@@ -755,13 +790,18 @@ def inject_user_context(user: Any | None, base_config: dict[str, Any] | None = N
         Configuration dict with user context injected
     """
     config: dict[str, Any] = (base_config or {}).copy()
-    config["configurable"] = config.get("configurable", {})
+    # Copy the nested dict too: callers reuse a base config across runs/users
+    # (e.g. one template for A and B), so writing trusted identity into a
+    # shared ``configurable`` would leak A's user_id into B's config.
+    config["configurable"] = dict(config.get("configurable") or {})
 
     # All user-related data injection (only if user exists)
     if user:
-        # Basic user identity for multi-tenant scoping
-        config["configurable"].setdefault("user_id", user.identity)
-        config["configurable"].setdefault("user_display_name", getattr(user, "display_name", None) or user.identity)
+        # Server-authenticated identity always wins: a client-supplied
+        # configurable.user_id must never masquerade as another tenant.
+        # Non-identity custom fields from the client config are preserved.
+        config["configurable"]["user_id"] = user.identity
+        config["configurable"]["user_display_name"] = getattr(user, "display_name", None) or user.identity
 
         config["configurable"]["langgraph_auth_user"] = user
 

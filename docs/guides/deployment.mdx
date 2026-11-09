@@ -53,6 +53,35 @@ What it does:
 5. Migrations apply automatically on startup
 6. Workers start automatically and begin processing runs from the Redis job queue — see the [worker architecture guide](/guides/worker-architecture) for details on job dispatch, concurrency, and crash recovery
 
+### Process roles (API vs worker)
+
+With `REDIS_BROKER_ENABLED=true` the run queue lives in Redis. Two entrypoints share it:
+
+```bash
+# HTTP API process: serves requests and enqueues runs.
+python -m aegra_api.main        # or `aegra serve`
+
+# Standalone worker process: consumes the queue and executes runs; no HTTP.
+python -m aegra_api.worker
+```
+
+`WORKER_ROLE` (deployment env only — never per-request) selects where consumer loops run:
+
+| Value | HTTP API process | `python -m aegra_api.worker` |
+| --- | --- | --- |
+| unset (default) | consumes — same as before role separation | consumes |
+| `all` | consumes (legacy single-process mode, explicit) | consumes |
+| `api` | enqueue-only; never starts consumers | refuses to boot |
+| `worker` | refuses to boot | consumes |
+
+For the split deployment set `WORKER_ROLE=api` on the API service and `WORKER_ROLE=worker` on the worker service.
+
+Notes:
+- The worker does not run migrations; keep `RUN_MIGRATIONS_ON_STARTUP=true` on the API process or run `aegra db upgrade` out-of-band.
+- With `REDIS_BROKER_ENABLED=false` there is no queue: the API process executes runs in-process (`LocalExecutor`) regardless of `WORKER_ROLE`.
+- Scale workers by setting `WORKER_COUNT` / `N_JOBS_PER_WORKER` on worker processes; crashed runs are recovered by the lease reaper.
+- `AEGRA_PERSISTENCE_REQUIRED=true` makes a graph that cannot receive the server checkpointer/store refuse to execute instead of running unpersisted. It is trusted server config (clients cannot set it); leave it false only for legacy graphs that do not support injection.
+
 The generated `docker-compose.yml` includes:
 - PostgreSQL with pgvector
 - Redis for job dispatch, SSE pub/sub, and crash recovery
