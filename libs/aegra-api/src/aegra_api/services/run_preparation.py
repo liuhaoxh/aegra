@@ -259,6 +259,19 @@ SYSTEM_IDENTITY = "system"
 #: principal without a tenant claim be scoped to it; it is never a client input.
 SINGLE_TENANT_ID_ENV = "AEGRA_SINGLE_TENANT_ID"
 
+#: Comma-separated claim names the deployment's auth backend may carry into a
+#: run on top of the built-in core fields (``PERSISTED_USER_FIELDS``). Claim
+#: names that look like credentials are still dropped, so this list can never
+#: re-admit a token or password; any claim neither built in nor listed here
+#: keeps failing admission closed.
+ALLOWED_PRINCIPAL_CLAIMS_ENV = "AEGRA_ALLOWED_PRINCIPAL_CLAIMS"
+
+
+def configured_principal_claims() -> tuple[str, ...]:
+    """Claim names approved by the deployment's auth configuration."""
+    raw = os.environ.get(ALLOWED_PRINCIPAL_CLAIMS_ENV, "")
+    return tuple(name.strip() for name in raw.split(",") if name.strip())
+
 
 def trusted_identity(user: User) -> tuple[str, str]:
     """Resolve ``(tenant_id, owner_id)`` from the authenticated context only.
@@ -587,7 +600,7 @@ async def _prepare_run(
     # non-credential claims are refused here (fail-closed) instead of being
     # silently dropped and changing the worker-side identity.
     try:
-        principal = project_principal(user)
+        principal = project_principal(user, allowed_claims=configured_principal_claims())
     except UnapprovedPrincipalClaim as exc:
         raise HTTPException(422, str(exc)) from None
     # Stamp the SERVER-resolved scope onto the projected principal (never a

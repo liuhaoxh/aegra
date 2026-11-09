@@ -28,6 +28,7 @@ from aegra_api.services.run_preparation import (
     _prepare_run,
     _replay,
     authorize_thread_scope,
+    bind_thread_scope,
     intent_digest,
     trusted_identity,
 )
@@ -99,14 +100,9 @@ class _Result:
 
 
 def _scope_session(row: object) -> AsyncMock:
-    """Session double for authorize_thread_scope's bind-then-lock sequence.
-
-    First statement is the create-if-absent INSERT, second is the
-    ``FOR UPDATE`` read. A regression to a plain read (no lock, no insert)
-    fails on the call count.
-    """
+    """Session double for authorize_thread_scope's single unlocked read."""
     session = AsyncMock()
-    session.execute = AsyncMock(side_effect=[_Result(None), _Result(row)])
+    session.execute = AsyncMock(return_value=_Result(row))
     return session
 
 
@@ -235,15 +231,29 @@ async def test_authorize_thread_scope_allows_owner() -> None:
     await authorize_thread_scope(session, "thread-1", _user("owner-1", "default"))
 
 
-async def test_authorize_thread_scope_creates_then_locks_missing_thread() -> None:
-    """Absent thread: create-if-absent under the trusted scope, then FOR UPDATE read."""
+async def test_authorize_thread_scope_passes_absent_thread_to_the_binding_step() -> None:
+    """Unlocked preflight: an absent thread is not an error, binding is later."""
     session = _scope_session(None)
+    await authorize_thread_scope(session, "thread-1", _user("owner-1"))
+    assert session.execute.await_count == 1
+
+
+async def test_bind_thread_scope_refuses_a_row_that_lost_the_insert_race() -> None:
+    """Create-if-absent, then FOR UPDATE read of the bound row."""
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=[_Result(None), _Result(("other-owner", "default"))])
     with pytest.raises(HTTPException) as exc:
-        await authorize_thread_scope(session, "thread-1", _user("owner-1"))
+        await bind_thread_scope(session, "thread-1", _user("owner-1"))
     # our own concurrent insert lost the PK race to another owner -> 404, never shared
     assert exc.value.status_code == 404
     assert session.execute.await_count == 2
-    await authorize_thread_scope(session, "thread-1", _user("owner-1"))
+
+
+async def test_bind_thread_scope_allows_own_bound_row() -> None:
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=[_Result(None), _Result(("owner-1", "default"))])
+    await bind_thread_scope(session, "thread-1", _user("owner-1"))
+    assert session.execute.await_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +452,7 @@ async def test_crash_before_enqueue_then_replay_recovers(
 
 
 def test_digest_is_stable_sha256_of_canonical_json() -> None:
+    """Frozen canonical form: every execution-affecting field is covered."""
     request = _request()
     expected = hashlib.sha256(
         json.dumps(
@@ -449,15 +460,26 @@ def test_digest_is_stable_sha256_of_canonical_json() -> None:
                 "assistant_id": "agent",
                 "input": request.input,
                 "command": None,
-                "checkpoint": None,
                 "config": {},
                 "context": {},
+                "checkpoint": None,
+                "durability": None,
+                "multitask_strategy": None,
+                "interrupt_before": None,
+                "interrupt_after": None,
+                "stream": False,
+                "stream_mode": None,
+                "stream_subgraphs": False,
+                "on_disconnect": None,
+                "on_completion": None,
+                "metadata": None,
             },
             sort_keys=True,
             separators=(",", ":"),
             default=str,
         ).encode()
     ).hexdigest()
+    assert expected == "7248fe7147ec8c306e3eab1255d5fe26a9f527623da5845068f7e35ca08acd3a"
     assert intent_digest(request) == expected
 
 # ---------------------------------------------------------------------------
@@ -667,23 +689,30 @@ async def test_worker_queue_payload_is_only_the_run_id() -> None:
     assert "acme" not in str(pushed) and "tok-1" not in str(pushed)
 
 
-def test_run_job_from_run_orm_restores_scope_columns() -> None:
-    """Worker recovery reads scope from the row, not only from the JSONB blob."""
+def test_run_job_from_run_orm_restores_scope_from_the_payload() -> None:
+    """Worker recovery reads scope from the persisted payload, never the row:
+    reading it back off the row would make the worker's row-vs-payload
+    comparison a tautology and hide a tampered payload."""
     run = MagicMock()
     run.run_id = "run-1"
     run.thread_id = "thread-1"
-    run.tenant_id = "acme"
-    run.operation_key = "op-1"
+    run.tenant_id = "tampered-row-tenant"
+    run.operation_key = "row-op"
+    run.admission_version = 9
     run.execution_params = {
         "graph_id": "agent",
-        "user": {"identity": "owner-1", "access_token": "t"},
+        "user": {"identity": "owner-1", "tenant_id": "acme"},
         "execution": {},
         "behavior": {},
         "run_metadata": {},
+        "tenant_id": "acme",
+        "operation_key": "op-1",
+        "admission_version": 1,
     }
     job = RunJob.from_run_orm(run)
     assert job.tenant_id == "acme"
     assert job.operation_key == "op-1"
+    assert job.admission_version == 1
 
 # ---------------------------------------------------------------------------
 # Digest covers every execution-affecting field; aliases stay equivalent
@@ -733,6 +762,8 @@ async def test_single_tenant_config_scope_is_stamped_on_principal(
     every run after restart."""
     _patch_common(monkeypatch)
     monkeypatch.setenv("AEGRA_SINGLE_TENANT_ID", "install-1")
+    # The thread row is attributed to the same trusted tenant.
+    _session.execute = AsyncMock(return_value=_Result(("owner-1", "install-1")))
     monkeypatch.setattr(mod, "_find_admitted_run", AsyncMock(return_value=None))
     _session.scalar = AsyncMock(return_value=_assistant())
     submit = AsyncMock()
@@ -772,7 +803,7 @@ async def test_keyless_run_still_persists_a_digest(
             _session, "thread-1", _request(operation_key=None), _user("owner-1"), initial_status="pending"
         )
 
-    run_orm = _session.add.await_args.args[0] if hasattr(_session.add, "await_args") else _session.add.call_args.args[0]
+    run_orm = _session.add.call_args.args[0]
     assert run_orm.operation_key is None
     assert run_orm.intent_digest is not None
     assert run_orm.admission_version is not None
@@ -804,7 +835,7 @@ async def test_thread_insert_carries_trusted_tenant(monkeypatch: pytest.MonkeyPa
     """POST /threads must write the trusted tenant, not rely on a DB default."""
     from aegra_api.api import threads as threads_api
 
-    captured: dict[str, Any] = {}
+    captured: list[Any] = []
 
     class _Scalars:
         def first(self):
@@ -812,18 +843,24 @@ async def test_thread_insert_carries_trusted_tenant(monkeypatch: pytest.MonkeyPa
 
     session = AsyncMock()
     session.scalars.return_value = _Scalars()
+    session.scalar = AsyncMock(return_value=None)
 
-    def _scalars(stmt):
-        captured["stmt"] = stmt
+    async def _scalars(stmt):
+        captured.append(stmt)
         return _Scalars()
 
     session.scalars = _scalars
     session.add = MagicMock()
 
-    await threads_api.create_thread(
-        threads_api.ThreadCreate(), User(identity="owner-1", tenant_id="tenant-a"), session
-    )
-    values = captured["stmt"].compile().params
+    # created is None (nothing inserted), so the endpoint ends in the 409
+    # conflict branch — the INSERT values are what this test pins.
+    with pytest.raises(HTTPException) as exc:
+        await threads_api.create_thread(
+            threads_api.ThreadCreate(), User(identity="owner-1", tenant_id="tenant-a"), session
+        )
+    assert exc.value.status_code == 409
+    insert = next(stmt for stmt in captured if "INSERT INTO" in str(stmt))
+    values = insert.compile().params
     assert "tenant-a" in values.values(), values
 
 
@@ -852,7 +889,13 @@ def test_worker_rejects_unattributed_legacy_row_in_multi_tenant_mode() -> None:
 
     job = RunJob(identity=RunIdentity(run_id="r", thread_id="t", graph_id="g"), user=User(identity="o"))
 
-    reason = asyncio.run(_verify_run_principal(AsyncMock(), run, job))
+    class _ThreadRow:
+        def one_or_none(self):
+            return ("o", None)
+
+    session = AsyncMock()
+    session.execute = AsyncMock(return_value=_ThreadRow())
+    reason = asyncio.run(_verify_run_principal(session, run, job))
     assert reason is not None and "no tenant attribution" in reason
 
 # ---------------------------------------------------------------------------

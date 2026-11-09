@@ -10,6 +10,7 @@ frozen=True for immutability. Serialization uses model_dump/model_validate
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -34,9 +35,12 @@ if TYPE_CHECKING:
 #: * ``permissions``       -> ``with_auth_ctx`` and ``require_permission``
 #: * ``scopes``            -> auth middleware surface read by the same handlers
 #:
-#: This is a closed list. There is deliberately NO operator-extensible key list:
-#: an env var would let ``access_token``/``password`` back into the persisted
-#: principal, which is exactly what must not happen.
+#: This is the core list every deployment carries. A deployment whose auth
+#: backend returns further claims (e.g. a conversation or workspace scope) names
+#: them in ``AEGRA_ALLOWED_PRINCIPAL_CLAIMS``; that allowlist is consulted on top
+#: of this list. Credential-shaped names are still dropped even when named there
+#: (see :data:`CREDENTIAL_FIELD_MARKERS`), so the extension cannot re-admit a
+#: token or password into the persisted principal.
 PERSISTED_USER_FIELDS: tuple[str, ...] = (
     "identity",
     "tenant_id",
@@ -46,11 +50,13 @@ PERSISTED_USER_FIELDS: tuple[str, ...] = (
     "scopes",
 )
 
-#: Field-name markers that identify a credential. Such extras are dropped (never
-#: persisted, never logged with values). Any OTHER extra field is not silently
-#: discarded — the caller must either drop it at the auth boundary or the
-#: admission is refused, because an unknown claim could change authorization
-#: somewhere downstream of us.
+#: Field-name markers that identify a credential. Such claims are dropped (never
+#: persisted, never logged with values) even when a deployment lists them in its
+#: allowed principal claims. Any OTHER claim outside
+#: :data:`PERSISTED_USER_FIELDS` ∪ the deployment allowlist is not silently
+#: discarded — the caller must either drop it at the auth boundary, name it in
+#: ``AEGRA_ALLOWED_PRINCIPAL_CLAIMS``, or the admission is refused, because an
+#: unknown claim could change authorization somewhere downstream of us.
 CREDENTIAL_FIELD_MARKERS: tuple[str, ...] = (
     "password",
     "passwd",
@@ -77,8 +83,9 @@ class UnapprovedPrincipalClaim(ValueError):
         self.claims = claims
         super().__init__(
             "Authenticated principal carries unapproved claims that would not survive "
-            f"into the run: {', '.join(sorted(claims))}. Drop them at the auth boundary "
-            "or add a reviewed field to PERSISTED_USER_FIELDS."
+            f"into the run: {', '.join(sorted(claims))}. Drop them at the auth boundary, "
+            "name them in AEGRA_ALLOWED_PRINCIPAL_CLAIMS, or add a reviewed field to "
+            "PERSISTED_USER_FIELDS."
         )
 
 
@@ -87,7 +94,7 @@ def _is_credential_field(name: str) -> bool:
     return any(marker in lowered for marker in CREDENTIAL_FIELD_MARKERS)
 
 
-def project_principal(user: User) -> User:
+def project_principal(user: User, *, allowed_claims: Iterable[str] = ()) -> User:
     """The single authenticated-principal projection used by every run path.
 
     Both the request-side execution (this object is what the executor gets) and
@@ -95,21 +102,28 @@ def project_principal(user: User) -> User:
     exact projection, so a recovered run executes as the same principal as the
     original one.
 
-    * credential-looking extras are dropped: they must never reach the DB,
-      the worker, or a log;
-    * any other extra claim is refused with :class:`UnapprovedPrincipalClaim`
-      (nothing is silently changed);
+    * only claims with a non-None value are carried: a declared-but-unset field
+      is not a claim, so ``User`` defaults (``email=None``, ``org_id=None``)
+      never trip the admission;
+    * credential-looking claims are dropped even when named in
+      ``allowed_claims``: they must never reach the DB, the worker, or a log;
+    * any other claim outside :data:`PERSISTED_USER_FIELDS` ∪ ``allowed_claims``
+      is refused with :class:`UnapprovedPrincipalClaim` (nothing is silently
+      changed);
     * business ``input``/``context`` payloads are NOT inspected or filtered —
       no content-security claim is made for them.
     """
-    data = user.model_dump()
-    extras = [key for key in data if key not in PERSISTED_USER_FIELDS]
-    unknown = [key for key in extras if not _is_credential_field(key)]
+    data = user.model_dump(exclude_none=True)
+    approved = set(PERSISTED_USER_FIELDS) | {name for name in allowed_claims if name}
+    # Credential-shaped claims are dropped whether or not the deployment named
+    # them: the allowlist cannot widen what may be persisted.
+    dropped = [key for key in data if _is_credential_field(key)]
+    unknown = [key for key in data if key not in approved and key not in dropped]
     if unknown:
         raise UnapprovedPrincipalClaim(unknown)
-    if extras:
-        logger.info("Dropped credential-bearing claims from run principal", fields=sorted(extras))
-    return User.model_validate({key: data[key] for key in PERSISTED_USER_FIELDS if key in data})
+    if dropped:
+        logger.info("Dropped credential-bearing claims from run principal", fields=sorted(dropped))
+    return User.model_validate({key: data[key] for key in data if key in approved and key not in dropped})
 
 
 class RunIdentity(BaseModel):
@@ -193,7 +207,7 @@ class RunJob(BaseModel):
         """
         return {
             "graph_id": self.identity.graph_id,
-            "user": self.user.model_dump(),
+            "user": self.user.model_dump(exclude_none=True),
             "execution": self.execution.model_dump(),
             "behavior": self.behavior.model_dump(),
             "run_metadata": self.run_metadata,
