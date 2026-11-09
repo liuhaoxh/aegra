@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, get_args, get_origin
 
 import structlog
+from fastapi import HTTPException
 from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 from langgraph.store.base import BaseStore
@@ -312,6 +313,32 @@ def _is_pydantic_model(cls: type) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _scoped_store(store: BaseStore | None, user: Any) -> BaseStore | None:
+    """Wrap the persistent store in the caller's trusted tenant/owner scope.
+
+    Graphs must not see the raw store: over HTTP the same principal is confined
+    to ``["users", tenant, owner]`` (``api/store.py``), and an unwrapped store in
+    ``ServerRuntime`` would let a graph read or write another tenant's items.
+    The scope comes from the authenticated principal only; a client-supplied
+    namespace is nested under it, never treated as a scope.
+    """
+    if store is None or user is None:
+        return store
+    from aegra_api.models.auth import User as _User
+    from aegra_api.services.run_preparation import trusted_identity
+    from aegra_api.services.tenant_store import TenantScopedStore
+
+    if not isinstance(user, _User):
+        # A non-Aegra principal (e.g. a raw LangGraph BaseUser from a library
+        # path) carries no trusted tenant. Do not hand it the raw store.
+        raise HTTPException(
+            403,
+            "Store access requires an authenticated Aegra principal with a trusted tenant",
+        )
+    tenant_id, owner_id = trusted_identity(user)
+    return TenantScopedStore(store, tenant_id, owner_id)
+
+
 def build_server_runtime(
     *,
     access_context: AccessContext,
@@ -345,7 +372,7 @@ def build_server_runtime(
         return _ExecutionRuntime(
             access_context=access_context,
             user=user,
-            store=store,
+            store=_scoped_store(store, user),
             context=context,
         )
     return _ReadRuntime(

@@ -8,6 +8,7 @@ Architecture:
 """
 
 import asyncio
+import inspect
 import copy
 import importlib.util
 import json
@@ -22,7 +23,10 @@ from uuid import uuid5
 import structlog
 from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.runnables import RunnableConfig
+from fastapi import HTTPException
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import StateGraph
+from langgraph.store.base import BaseStore
 from langgraph.pregel import Pregel
 from langgraph_sdk.auth.types import BaseUser
 from sqlalchemy import func, select
@@ -168,6 +172,145 @@ def _require_persistence_if_configured(checkpointer: Any, store: Any, graph_id: 
             f"Persistence is required (AEGRA_PERSISTENCE_REQUIRED=true) but "
             f"checkpointer/store is unavailable for graph {graph_id!r}"
         )
+
+
+#: The single authoritative seam a restricted graph exposes for read-path
+#: persistence. Root-side restricted graphs raise a business error from
+#: ``__getattr__``, so the seam is read statically — never by swallowing the
+#: error and assuming the graph has no business saver. Plain compiled Pregel
+#: graphs use their native ``checkpointer`` attribute instead.
+RESTRICTED_GRAPH_CHECKPOINTER_ATTR = "readonly_checkpointer"
+
+_MISSING = object()
+
+
+def _static_attr(obj: Any, name: str) -> Any:
+    """Existence probe only: never invokes ``__getattr__``/descriptors."""
+    try:
+        return inspect.getattr_static(obj, name, _MISSING)
+    except Exception:  # pragma: no cover - pathological descriptors
+        return _MISSING
+
+
+def _eval_attr(obj: Any, name: str) -> Any:
+    """Evaluate an attribute that the static probe proved exists.
+
+    ``inspect.getattr_static`` returns a *descriptor* for properties (e.g. the
+    root-side ``readonly_checkpointer`` is a property), so the value must be
+    fetched through normal attribute access — inside a guard: a seam that exists
+    but cannot be evaluated is fail-closed, never "absent".
+    """
+    try:
+        return getattr(obj, name)
+    except Exception as exc:
+        raise RuntimeError(f"{name} exists but could not be evaluated: {exc}") from exc
+
+
+def _resolve_graph_persistence(graph_obj: Any) -> tuple[Any, bool]:
+    """Return ``(checkpointer, found)`` for a graph.
+
+    ``getattr_static`` is used only to decide whether an attribute exists, so a
+    restricted graph's ``__getattr__`` business error is never triggered while
+    probing. The value itself is then read with normal attribute access, which
+    correctly materialises property-based seams; evaluation failures propagate
+    as ``RuntimeError`` (fail-closed) instead of being mistaken for "no saver".
+
+    Order: the native ``checkpointer`` attribute (plain compiled Pregel), then
+    the single restricted-graph seam ``readonly_checkpointer``.
+    """
+    if _static_attr(graph_obj, "checkpointer") is not _MISSING:
+        return _eval_attr(graph_obj, "checkpointer"), True
+
+    if _static_attr(graph_obj, RESTRICTED_GRAPH_CHECKPOINTER_ATTR) is _MISSING:
+        return None, False
+
+    seam = _eval_attr(graph_obj, RESTRICTED_GRAPH_CHECKPOINTER_ATTR)
+    if seam is None:
+        return None, True
+    if isinstance(seam, BaseCheckpointSaver):
+        return seam, True
+    if _static_attr(seam, "checkpointer") is _MISSING:
+        raise RuntimeError(
+            f"{RESTRICTED_GRAPH_CHECKPOINTER_ATTR} is present but does not expose a checkpointer "
+            f"(type {type(seam).__name__}); refusing to attach persistence blindly"
+        )
+    nested = _eval_attr(seam, "checkpointer")
+    if nested is None:
+        raise RuntimeError(
+            f"{RESTRICTED_GRAPH_CHECKPOINTER_ATTR}.checkpointer is None "
+            f"(type {type(seam).__name__}); refusing to attach persistence blindly"
+        )
+    return nested, True
+
+
+def _attach_persistence(
+    graph_obj: Any,
+    checkpointer: BaseCheckpointSaver | None,
+    store: BaseStore | None,
+    user: Any,
+    graph_id: str,
+) -> Any:
+    """Attach persistence to a compiled graph without clobbering a business saver.
+
+    ``Pregel.copy(update={...})`` replaces attributes wholesale. If the graph (or
+    its factory) already carries a checkpointer — for FollowMe graphs that is a
+    boundary-aware saver with its own credential and physical-key policy — a
+    blanket update silently overwrites it. The rules:
+
+    * ``store``: always scoped to the trusted principal via
+      :func:`TenantScopedStore`; raw stores are never handed to a graph.
+      Execution AND read paths both need authorization, so ``user=None`` means
+      no store is attached at all (fail-closed), except for the system
+      registration path which does not go through this helper.
+    * ``checkpointer``: attach the deployment checkpointer only when the graph
+      does not already have one. A graph-supplied checkpointer is preserved
+      untouched — this fork never imports or guesses a business saver class, and
+      never shares a mutable saver between principals.
+
+    Returns the graph instance to use.
+    """
+    from aegra_api.models.auth import User as _User
+    from aegra_api.services.tenant_store import TenantScopedStore
+
+    scoped_store: BaseStore | None = None
+    if store is not None:
+        if not isinstance(user, _User):
+            raise HTTPException(
+                403,
+                f"Graph '{graph_id}' requires an authenticated principal for store access",
+            )
+        from aegra_api.services.run_preparation import trusted_identity
+
+        tenant_id, owner_id = trusted_identity(user)
+        scoped_store = TenantScopedStore(store, tenant_id, owner_id)
+
+    try:
+        existing_checkpointer, graph_supplies_persistence = _resolve_graph_persistence(graph_obj)
+    except Exception as exc:
+        # A seam that exists but cannot be evaluated is a hard failure: never
+        # downgrade it to "graph has no saver".
+        raise RuntimeError(f"Graph '{graph_id}' persistence seam is unusable: {exc}") from exc
+    if not graph_supplies_persistence:
+        if not isinstance(graph_obj, Pregel):
+            # A non-Pregel object with no persistence seam is a restricted or
+            # proxied graph whose execution contract we do not own. Guessing
+            # "no saver" would overwrite a boundary saver; fail closed instead.
+            raise RuntimeError(
+                f"Graph '{graph_id}' exposes no persistence seam "
+                f"(type {type(graph_obj).__name__}); refusing to attach persistence blindly"
+            )
+        # Plain compiled graph: attach the deployment checkpointer as before.
+        return graph_obj.copy(update={"checkpointer": checkpointer, "store": scoped_store})
+    if existing_checkpointer is None:
+        # A seam explicitly declared "no checkpointer": attach the deployment one.
+        return graph_obj.copy(update={"checkpointer": checkpointer, "store": scoped_store})
+
+    logger.info(
+        "Preserving graph-supplied checkpointer",
+        graph_id=graph_id,
+        saver_type=type(existing_checkpointer).__name__,
+    )
+    return graph_obj.copy(update={"store": scoped_store})
 
 
 class LangGraphService:
@@ -525,7 +668,9 @@ class LangGraphService:
                 # (_apply_injection_policy). Do this BEFORE yield to avoid
                 # dual-yield when exceptions occur in the context body.
                 try:
-                    graph_to_use = graph_obj.copy(update={"checkpointer": checkpointer, "store": store})
+                    graph_to_use = _attach_persistence(
+                        graph_obj, checkpointer, store, user, graph_id
+                    )
                 except Exception as exc:
                     graph_to_use = _apply_injection_policy(graph_obj, graph_id, exc)
 
